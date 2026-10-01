@@ -32,9 +32,19 @@ NON_CRED_EXTENSIONS = {
     ".pdf", ".docx", ".xlsx", ".pptx"
 }
 
+def find_system_unrar() -> Optional[str]:
+    """Finds official unrar binary if available."""
+    for binary in ["unrar", "/usr/local/bin/unrar", "/usr/bin/unrar", "C:\\Program Files\\WinRAR\\unrar.exe"]:
+        found = shutil.which(binary)
+        if found:
+            return found
+        if os.path.isfile(binary):
+            return binary
+    return None
+
 def find_system_7z() -> Optional[str]:
     """Finds system 7z binary if available."""
-    for binary in ["7z", "7za", "7zr", "C:\\Program Files\\7-Zip\\7z.exe"]:
+    for binary in ["7z", "7za", "7zr", "/usr/bin/7z", "C:\\Program Files\\7-Zip\\7z.exe"]:
         found = shutil.which(binary)
         if found:
             return found
@@ -45,24 +55,46 @@ def find_system_7z() -> Optional[str]:
 def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] = None) -> Tuple[bool, bool, Optional[str]]:
     """
     Unpacks ZIP, RAR, or 7Z archives completely into dest_dir.
+    Uses official RARLAB unrar for RAR archives, and 7z CLI for 7Z/ZIP archives.
     Returns (success: bool, is_encrypted: bool, error_msg: Optional[str]).
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     suffix = archive_path.suffix.lower()
+    unrar_bin = find_system_unrar()
     seven_z = find_system_7z()
+    clean_pass = password.strip() if password else None
     is_encrypted = False
 
-    # Strategy 1: System 7z CLI
+    # Strategy 1: Official RARLAB unrar for RAR archives (Highest reliability for RAR5 + Encrypted)
+    if suffix == ".rar" and unrar_bin:
+        cmd = [unrar_bin, "x", "-y", "-idq"]
+        if clean_pass:
+            cmd.append(f"-p{clean_pass}")
+        else:
+            cmd.append("-p-")
+        cmd.extend([str(archive_path), str(dest_dir) + os.sep])
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
+            combined_out = (res.stdout or "") + " " + (res.stderr or "")
+            if res.returncode == 11 or any(k in combined_out.lower() for k in ["wrong password", "password required", "bad password", "corrupt header"]):
+                return False, True, "Password required or wrong password"
+
+            if res.returncode in (0, 1) and any(dest_dir.iterdir()):
+                return True, False, None
+        except Exception as e:
+            print(f"[!] unrar CLI execution failed: {e}")
+
+    # Strategy 2: System 7z CLI (for 7Z, ZIP, and fallback)
     if seven_z:
         cmd = [seven_z, "x", str(archive_path), f"-o{dest_dir}", "-y"]
-        if password:
-            cmd.append(f"-p{password}")
+        if clean_pass:
+            cmd.append(f"-p{clean_pass}")
         else:
             cmd.append("-p-")
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
             combined_out = (res.stdout or "") + " " + (res.stderr or "")
-            if any(k in combined_out.lower() for k in ["wrong password", "encrypted", "can not open encrypted", "data error in encrypted"]):
+            if any(k in combined_out.lower() for k in ["wrong password", "data error in encrypted file", "can not open encrypted"]):
                 is_encrypted = True
 
             if res.returncode in (0, 1) and any(dest_dir.iterdir()):
@@ -73,8 +105,8 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
         except Exception as e:
             print(f"[!] 7z CLI execution failed: {e}")
 
-    # Strategy 2: Python Libraries Fallback
-    pwd_bytes = password.encode() if password else None
+    # Strategy 3: Python Libraries Fallback
+    pwd_bytes = clean_pass.encode() if clean_pass else None
     try:
         if suffix == ".zip":
             with zipfile.ZipFile(archive_path, "r") as z:
@@ -87,15 +119,17 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
                 return True, False, None
 
         elif suffix == ".rar" and rarfile:
+            if unrar_bin:
+                rarfile.UNRAR_TOOL = unrar_bin
             with rarfile.RarFile(archive_path, "r") as r:
-                if password:
-                    r.setpassword(password)
+                if clean_pass:
+                    r.setpassword(clean_pass)
                 r.extractall(path=dest_dir)
             if any(dest_dir.iterdir()):
                 return True, False, None
 
         elif suffix == ".7z" and py7zr:
-            with py7zr.SevenZipFile(archive_path, mode="r", password=password) as z:
+            with py7zr.SevenZipFile(archive_path, mode="r", password=clean_pass) as z:
                 z.extractall(path=dest_dir)
             if any(dest_dir.iterdir()):
                 return True, False, None
