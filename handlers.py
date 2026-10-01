@@ -12,9 +12,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
 
-from config import DOWNLOAD_DIR, SESSIONS_DIR, OUTPUT_DIR
+from config import DOWNLOAD_DIR, SESSIONS_DIR, OUTPUT_DIR, SESSION_TTL_SECONDS
 from keyboards import main_menu_keyboard, session_action_keyboard
 from downloader import download_from_url, parse_credentials_from_text
+from cleanup import touch_session
 from extractor import (
     unpack_archive,
     scan_session_stats,
@@ -139,6 +140,7 @@ async def setup_session_archive(message: Message, archive_file: Path, password: 
         f"✈️ <b>TData Sessions:</b> <code>{stats['tdata_folders']}</code>\n"
         f"🖥️ <b>RDP Profiles:</b> <code>{stats['rdp_files']}</code>\n"
         f"📦 <b>Unpacked Size:</b> <code>{stats['size_mb']} MB</code>\n\n"
+        f"⏱️ <i>Auto-Cleanup: This session will be purged from disk in {SESSION_TTL_SECONDS // 60} minutes to keep RAM & Disk free!</i>\n\n"
         f"🎯 <i>Select what you want to extract:</i>"
     )
     await message.answer(info_text, reply_markup=session_action_keyboard(), parse_mode="HTML")
@@ -263,14 +265,14 @@ async def action_cookies_callback(query: CallbackQuery):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
-    status_msg = await query.message.answer("🍪 <b>Aggregating cookies...</b>", parse_mode="HTML")
+    status_msg = await query.message.answer("🍪 <b>Aggregating cookies across all logs...</b>", parse_mode="HTML")
     out_file = OUTPUT_DIR / f"cookies_{query.from_user.id}.txt"
 
     loop = asyncio.get_running_loop()
-    count = await loop.run_in_executor(None, collect_cookies, session_dir, out_file)
+    file_count, total_lines = await loop.run_in_executor(None, collect_cookies, session_dir, out_file)
 
-    if count == 0:
-        await status_msg.edit_text("⚠️ No cookie files found.")
+    if file_count == 0 or total_lines == 0:
+        await status_msg.edit_text("⚠️ No cookie records found in this archive.")
         out_file.unlink(missing_ok=True)
         await query.answer()
         return
@@ -279,7 +281,7 @@ async def action_cookies_callback(query: CallbackQuery):
     await send_file_safely(
         message=query.message,
         file_path=out_file,
-        caption=f"🍪 <b>Aggregated from {count} cookie logs!</b>",
+        caption=f"🍪 <b>Collected {total_lines:,} cookie lines from {file_count} log sources!</b>",
         filename_override="all_cookies.txt"
     )
     await query.answer()
@@ -291,14 +293,14 @@ async def action_cards_callback(query: CallbackQuery):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
-    status_msg = await query.message.answer("💳 <b>Extracting cards & autofill...</b>", parse_mode="HTML")
+    status_msg = await query.message.answer("💳 <b>Deep scanning for credit cards & autofill...</b>", parse_mode="HTML")
     out_file = OUTPUT_DIR / f"cards_{query.from_user.id}.txt"
 
     loop = asyncio.get_running_loop()
-    count = await loop.run_in_executor(None, collect_cards, session_dir, out_file)
+    total_cards, files_with_cards = await loop.run_in_executor(None, collect_cards, session_dir, out_file)
 
-    if count == 0:
-        await status_msg.edit_text("⚠️ No card records found.")
+    if total_cards == 0:
+        await status_msg.edit_text("⚠️ No credit card or autofill records found.")
         out_file.unlink(missing_ok=True)
         await query.answer()
         return
@@ -307,7 +309,7 @@ async def action_cards_callback(query: CallbackQuery):
     await send_file_safely(
         message=query.message,
         file_path=out_file,
-        caption=f"💳 <b>Collected from {count} card/autofill files!</b>",
+        caption=f"💳 <b>Extracted {total_cards:,} unique credit cards from {files_with_cards} files!</b>",
         filename_override="cards_autofill.txt"
     )
     await query.answer()

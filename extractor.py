@@ -3,6 +3,7 @@ import os
 import shutil
 import zipfile
 import subprocess
+import re
 from pathlib import Path
 from typing import List, Set, Optional, Tuple, Dict
 
@@ -20,8 +21,18 @@ PASSWORD_FILENAMES = {
     "passwords.txt", "password.txt", "passwords", "credentials.txt",
     "logins.txt", "all passwords.txt", "account.txt", "accounts.txt"
 }
-COOKIE_FILENAMES = {"cookie", "cookies"}
-CARD_FILENAMES = {"cards.txt", "autofill.txt", "credit_cards.txt", "cc.txt", "wallet.txt", "wallets"}
+
+# Regex to detect Credit Card pipe/delimiter format: CARD|MM|YY|CVV|HOLDER
+CARD_PIPE_REGEX = re.compile(
+    r"(?:\b|\A)([2-6]\d{12,18})[|\t:;, /]+(0[1-9]|1[0-2]|\d)[|\t:;, /]+(\d{2,4})(?:[|\t:;, /]+(\d{3,4}))?(?:[|\t:;, /]*([^|\r\n\t]*))?",
+    re.MULTILINE
+)
+
+# Regex to detect lines already in card pipe format
+CARD_LINE_PREFIX_REGEX = re.compile(
+    r"^\s*([2-6]\d{12,18})\|(\d{1,2})\|(\d{2,4})(?:\|([^|\r\n]*))?(?:\|([^|\r\n]*))?",
+    re.MULTILINE
+)
 
 def find_system_7z() -> Optional[str]:
     """Finds system 7z binary if available."""
@@ -43,7 +54,7 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
     suffix = archive_path.suffix.lower()
     seven_z = find_system_7z()
 
-    # Strategy 1: System 7z CLI (Fastest, handles RAR5, ZIP, 7Z, password protected)
+    # Strategy 1: System 7z CLI
     if seven_z:
         cmd = [seven_z, "x", str(archive_path), f"-o{dest_dir}", "-y"]
         if password:
@@ -51,7 +62,7 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
         else:
             cmd.append("-p-")
         try:
-            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
             if res.returncode == 0 and any(dest_dir.iterdir()):
                 return True
         except Exception as e:
@@ -62,7 +73,6 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
     try:
         if suffix == ".zip":
             with zipfile.ZipFile(archive_path, "r") as z:
-                # Secure extraction check against path traversal
                 for member in z.infolist():
                     target_path = dest_dir / member.filename
                     if not target_path.resolve().is_relative_to(dest_dir.resolve()):
@@ -87,6 +97,17 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
 
     return False
 
+def is_cookie_path(root_lower: str, file_lower: str) -> bool:
+    """Checks if a file is a cookie file by parent directory or filename."""
+    if "cookie" in root_lower or "cookie" in file_lower:
+        return file_lower.endswith(".txt") or file_lower.endswith(".json") or file_lower.endswith(".sqlite") or file_lower.endswith(".log")
+    return False
+
+def is_card_path(root_lower: str, file_lower: str) -> bool:
+    """Checks if a file is an autofill or card file by directory or filename."""
+    keywords = ["card", "credit", "autofill", "cc", "wallet", "payment", "web data"]
+    return any(k in root_lower or k in file_lower for k in keywords)
+
 def scan_session_stats(session_path: Path) -> dict:
     """Analyzes unpacked logs to count total files, logs, cookies, passwords, and sessions."""
     stats = {
@@ -101,6 +122,7 @@ def scan_session_stats(session_path: Path) -> dict:
     total_bytes = 0
 
     for root, dirs, files in os.walk(session_path):
+        root_l = root.lower()
         for d in dirs:
             if d.lower() == "tdata":
                 stats["tdata_folders"] += 1
@@ -116,27 +138,30 @@ def scan_session_stats(session_path: Path) -> dict:
 
             if fl.endswith(".rdp"):
                 stats["rdp_files"] += 1
-            if any(p in fl for p in PASSWORD_FILENAMES):
+            if any(p in fl for p in PASSWORD_FILENAMES) or ("password" in root_l and fl.endswith(".txt")):
                 stats["password_files"] += 1
-            if any(c in fl for c in COOKIE_FILENAMES) and fl.endswith(".txt"):
+            if is_cookie_path(root_l, fl):
                 stats["cookie_files"] += 1
-            if any(cd in fl for cd in CARD_FILENAMES):
+            if is_card_path(root_l, fl):
                 stats["card_files"] += 1
 
     stats["size_mb"] = round(total_bytes / (1024 * 1024), 2)
     return stats
 
 def read_file_safe(file_path: Path) -> Optional[str]:
-    """Reads file with UTF-8 or UTF-16 fallback to support various stealer formats."""
+    """Reads file with UTF-8, UTF-16, or Latin-1 fallback."""
     try:
         with open(file_path, "rb") as bf:
-            raw = bf.read(65536 * 16) # Read up to 1MB per chunk
-            if b"\x00" in raw[:100]: # Likely UTF-16
+            raw = bf.read(65536 * 16)
+            if b"\x00" in raw[:100]:
                 try:
                     return raw.decode("utf-16-le", errors="ignore")
                 except Exception:
                     pass
-            return raw.decode("utf-8", errors="ignore")
+            try:
+                return raw.decode("utf-8", errors="ignore")
+            except Exception:
+                return raw.decode("latin-1", errors="ignore")
     except Exception:
         return None
 
@@ -152,9 +177,10 @@ def search_keywords_in_logs(session_path: Path, keyword: str, max_results: int =
     total_found = 0
 
     for root, _, files in os.walk(session_path):
+        root_l = root.lower()
         for file in files:
             fl = file.lower()
-            if fl.endswith(".txt") or any(pf in fl for pf in PASSWORD_FILENAMES):
+            if fl.endswith(".txt") or any(pf in fl for pf in PASSWORD_FILENAMES) or "password" in root_l:
                 file_path = Path(root) / file
                 content = read_file_safe(file_path)
                 if not content or keyword_lower not in content.lower():
@@ -165,7 +191,7 @@ def search_keywords_in_logs(session_path: Path, keyword: str, max_results: int =
                 while i < len(lines):
                     line = lines[i]
                     if keyword_lower in line.lower():
-                        # Check for multi-line block format (Redline / Vidar / Lumma)
+                        # Multi-line block format (Redline / Vidar / Lumma)
                         block = []
                         start_idx = max(0, i - 1)
                         end_idx = min(len(lines), i + 6)
@@ -201,43 +227,119 @@ def search_keywords_in_logs(session_path: Path, keyword: str, max_results: int =
 
     return results, total_found
 
-def collect_cookies(session_path: Path, output_file: Path) -> int:
-    """Merges all Netscape/text cookie files found in the session."""
+def collect_cookies(session_path: Path, output_file: Path) -> Tuple[int, int]:
+    """
+    Collects all cookie files across the entire session:
+    Detects cookies by directory name (Cookies/) as well as filenames.
+    Merges all text cookies into output_file.
+    Returns (number_of_cookie_files, total_cookie_lines).
+    """
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    count = 0
-    with open(output_file, "w", encoding="utf-8", errors="ignore") as outfile:
-        for root, _, files in os.walk(session_path):
-            for file in files:
-                fl = file.lower()
-                if any(c in fl for c in COOKIE_FILENAMES) and fl.endswith(".txt"):
-                    count += 1
-                    file_path = Path(root) / file
-                    outfile.write(f"\n# --- Source: {file_path.name} ---\n")
-                    try:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as inf:
-                            shutil.copyfileobj(inf, outfile)
-                    except Exception:
-                        pass
-    return count
+    file_count = 0
+    total_lines = 0
 
-def collect_cards(session_path: Path, output_file: Path) -> int:
-    """Collects all credit card and autofill files found in the session."""
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    count = 0
     with open(output_file, "w", encoding="utf-8", errors="ignore") as outfile:
         for root, _, files in os.walk(session_path):
+            root_l = root.lower()
             for file in files:
                 fl = file.lower()
-                if any(cd in fl for cd in CARD_FILENAMES):
-                    count += 1
+                if is_cookie_path(root_l, fl):
                     file_path = Path(root) / file
-                    outfile.write(f"\n# --- Source: {file_path.name} ---\n")
                     try:
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as inf:
-                            shutil.copyfileobj(inf, outfile)
+                            lines = inf.readlines()
+                            if lines:
+                                file_count += 1
+                                total_lines += len(lines)
+                                outfile.write(f"\n# --- Cookie Source: {file_path.name} ({len(lines)} lines) ---\n")
+                                outfile.writelines(lines)
                     except Exception:
                         pass
-    return count
+
+    return file_count, total_lines
+
+def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
+    """
+    High-Speed Deep Credit Card Harvester:
+    Scans every text, autofill, card, and log file across the archive.
+    Extracts all credit card records matching:
+    - Standard pipe format: NUMBER|MM|YY|CVV|HOLDER
+    - Autofill records & CC blocks
+    Deduplicates and outputs clean lines.
+    Returns (total_unique_cards, files_with_cards).
+    """
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    unique_cards: Set[str] = set()
+    files_with_cards = 0
+
+    for root, _, files in os.walk(session_path):
+        root_l = root.lower()
+        for file in files:
+            fl = file.lower()
+            if fl.endswith(".txt") or fl.endswith(".log") or is_card_path(root_l, fl):
+                file_path = Path(root) / file
+                content = read_file_safe(file_path)
+                if not content:
+                    continue
+
+                initial_len = len(unique_cards)
+
+                # Strategy 1: Match existing pipe-delimited card lines
+                for m in CARD_LINE_PREFIX_REGEX.finditer(content):
+                    card_num, mm, yy, cvv, name = m.group(1), m.group(2), m.group(3), m.group(4) or "", m.group(5) or ""
+                    clean_line = f"{card_num}|{mm.zfill(2)}|{yy[-2:]}|{cvv.strip()}|{name.strip()}"
+                    unique_cards.add(clean_line)
+
+                # Strategy 2: Match general delimiter patterns in text
+                for m in CARD_PIPE_REGEX.finditer(content):
+                    card_num, mm, yy, cvv, name = m.group(1), m.group(2), m.group(3), m.group(4) or "", m.group(5) or ""
+                    # Validate month
+                    try:
+                        month_int = int(mm)
+                        if 1 <= month_int <= 12:
+                            clean_line = f"{card_num}|{str(month_int).zfill(2)}|{yy[-2:]}|{cvv.strip()}|{name.strip()}"
+                            unique_cards.add(clean_line)
+                    except ValueError:
+                        continue
+
+                # Strategy 3: Parse multiline labeled cards (Card Number: ... Exp: ... Cvv: ...)
+                if "card" in content.lower() or "credit" in content.lower():
+                    lines = content.splitlines()
+                    for idx, line in enumerate(lines):
+                        if any(c_kw in line.lower() for c_kw in ["card number", "number:", "card:"]):
+                            num_match = re.search(r"([2-6]\d{12,18})", line)
+                            if num_match:
+                                c_num = num_match.group(1)
+                                c_mm, c_yy, c_cvv, c_name = "01", "30", "", ""
+                                # search subsequent 5 lines for exp, cvv, holder
+                                for sub_idx in range(idx + 1, min(len(lines), idx + 6)):
+                                    sub_line = lines[sub_idx]
+                                    exp_match = re.search(r"(\d{1,2})[/-](\d{2,4})", sub_line)
+                                    if exp_match:
+                                        c_mm = exp_match.group(1).zfill(2)
+                                        c_yy = exp_match.group(2)[-2:]
+                                    cvv_match = re.search(r"(?:cvv|cvc|code)[:\s]*(\d{3,4})", sub_line, re.IGNORECASE)
+                                    if cvv_match:
+                                        c_cvv = cvv_match.group(1)
+                                    holder_match = re.search(r"(?:holder|name)[:\s]*([A-Za-z ]+)", sub_line, re.IGNORECASE)
+                                    if holder_match:
+                                        c_name = holder_match.group(1).strip()
+                                
+                                clean_line = f"{c_num}|{c_mm}|{c_yy}|{c_cvv}|{c_name}"
+                                unique_cards.add(clean_line)
+
+                if len(unique_cards) > initial_len:
+                    files_with_cards += 1
+
+    # Write all deduplicated cards to output file
+    with open(output_file, "w", encoding="utf-8") as outfile:
+        outfile.write(f"# Extracted Cards & Autofill Records | Total Found: {len(unique_cards)}\n")
+        outfile.write("# Format: NUMBER|EXP_MONTH|EXP_YEAR|CVV|HOLDER\n")
+        outfile.write("#" + "=" * 60 + "\n\n")
+        for card in sorted(unique_cards):
+            outfile.write(card + "\n")
+
+    return len(unique_cards), files_with_cards
 
 def collect_all_passwords(session_path: Path, output_file: Path) -> int:
     """Collects all passwords/credentials files into one aggregated file."""
@@ -245,9 +347,10 @@ def collect_all_passwords(session_path: Path, output_file: Path) -> int:
     count = 0
     with open(output_file, "w", encoding="utf-8", errors="ignore") as outfile:
         for root, _, files in os.walk(session_path):
+            root_l = root.lower()
             for file in files:
                 fl = file.lower()
-                if any(p in fl for p in PASSWORD_FILENAMES):
+                if any(p in fl for p in PASSWORD_FILENAMES) or ("password" in root_l and fl.endswith(".txt")):
                     count += 1
                     file_path = Path(root) / file
                     outfile.write(f"\n# --- Log File: {file_path.name} ---\n")
