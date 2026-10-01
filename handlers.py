@@ -12,7 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
 
-from config import DOWNLOAD_DIR, SESSIONS_DIR, OUTPUT_DIR, SESSION_TTL_SECONDS
+from config import DOWNLOAD_DIR, SESSIONS_DIR, OUTPUT_DIR, SESSION_TTL_SECONDS, USERS_SESSIONS_DIR
 from keyboards import main_menu_keyboard, session_action_keyboard
 from downloader import download_from_url, parse_credentials_from_text
 from cleanup import touch_session
@@ -35,7 +35,7 @@ class BotState(StatesGroup):
     waiting_for_keyword = State()
 
 def get_user_session_dir(user_id: int) -> Path:
-    return SESSIONS_DIR / str(user_id)
+    return USERS_SESSIONS_DIR / str(user_id)
 
 async def send_file_safely(message: Message, file_path: Path, caption: str, filename_override: str = None):
     """

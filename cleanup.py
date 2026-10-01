@@ -5,7 +5,7 @@ import shutil
 import asyncio
 import logging
 from pathlib import Path
-from config import SESSIONS_DIR, DOWNLOAD_DIR, OUTPUT_DIR, SESSION_TTL_SECONDS
+from config import USERS_SESSIONS_DIR, DOWNLOAD_DIR, OUTPUT_DIR, SESSION_TTL_SECONDS
 
 logger = logging.getLogger("cleanup_worker")
 
@@ -39,7 +39,7 @@ async def background_cleanup_loop(interval_seconds: int = 60):
     logger.info(f"[*] Background disk cleanup worker started (TTL: {SESSION_TTL_SECONDS}s / {SESSION_TTL_SECONDS // 60}m).")
     while True:
         try:
-            purge_expired_items(SESSIONS_DIR, SESSION_TTL_SECONDS)
+            purge_expired_items(USERS_SESSIONS_DIR, SESSION_TTL_SECONDS)
             purge_expired_items(DOWNLOAD_DIR, SESSION_TTL_SECONDS)
             purge_expired_items(OUTPUT_DIR, SESSION_TTL_SECONDS)
         except Exception as err:

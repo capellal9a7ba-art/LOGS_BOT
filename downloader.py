@@ -82,11 +82,8 @@ async def download_from_url(
     progress_callback: Optional[Callable[[int, int], Awaitable[None]]] = None
 ) -> Path:
     """Downloads a file from supported cloud hosts or direct URLs."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-
-    async with aiohttp.ClientSession(headers=headers) as session:
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=1800, connect=120)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         direct_url = url.strip()
         filename = None
 
