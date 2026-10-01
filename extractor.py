@@ -42,15 +42,15 @@ def find_system_7z() -> Optional[str]:
             return binary
     return None
 
-def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] = None) -> bool:
+def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] = None) -> Tuple[bool, bool, Optional[str]]:
     """
     Unpacks ZIP, RAR, or 7Z archives completely into dest_dir.
-    Prioritizes native 7z CLI for maximum speed and RAR5 compatibility.
-    Falls back to Python libraries.
+    Returns (success: bool, is_encrypted: bool, error_msg: Optional[str]).
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     suffix = archive_path.suffix.lower()
     seven_z = find_system_7z()
+    is_encrypted = False
 
     # Strategy 1: System 7z CLI
     if seven_z:
@@ -60,9 +60,16 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
         else:
             cmd.append("-p-")
         try:
-            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
-            if res.returncode == 0 and any(dest_dir.iterdir()):
-                return True
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
+            combined_out = (res.stdout or "") + " " + (res.stderr or "")
+            if any(k in combined_out.lower() for k in ["wrong password", "encrypted", "can not open encrypted", "data error in encrypted"]):
+                is_encrypted = True
+
+            if res.returncode in (0, 1) and any(dest_dir.iterdir()):
+                return True, False, None
+            else:
+                if is_encrypted:
+                    return False, True, "Password required or wrong password"
         except Exception as e:
             print(f"[!] 7z CLI execution failed: {e}")
 
@@ -76,24 +83,33 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
                     if not target_path.resolve().is_relative_to(dest_dir.resolve()):
                         continue
                     z.extract(member, path=dest_dir, pwd=pwd_bytes)
-            return True
+            if any(dest_dir.iterdir()):
+                return True, False, None
 
         elif suffix == ".rar" and rarfile:
             with rarfile.RarFile(archive_path, "r") as r:
                 if password:
                     r.setpassword(password)
                 r.extractall(path=dest_dir)
-            return True
+            if any(dest_dir.iterdir()):
+                return True, False, None
 
         elif suffix == ".7z" and py7zr:
             with py7zr.SevenZipFile(archive_path, mode="r", password=password) as z:
                 z.extractall(path=dest_dir)
-            return True
+            if any(dest_dir.iterdir()):
+                return True, False, None
 
+    except (zipfile.BadZipFile, RuntimeError) as err:
+        err_str = str(err).lower()
+        if "password" in err_str or "encrypted" in err_str:
+            return False, True, "Password required"
     except Exception as err:
-        print(f"[!] Python extraction failed: {err}")
+        err_str = str(err).lower()
+        if "password" in err_str:
+            return False, True, "Password required"
 
-    return False
+    return False, is_encrypted, "Extraction failed"
 
 def is_cookie_path(root_lower: str, file_lower: str) -> bool:
     """Checks if a file is a cookie file by parent directory or filename."""

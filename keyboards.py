@@ -30,3 +30,15 @@ def session_action_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑️ Delete / Clear Session", callback_data="action_clear")
         ]
     ])
+
+def password_prompt_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard asking if archive is encrypted."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⚡ Extract (No Password)", callback_data="extract_no_pass"),
+            InlineKeyboardButton(text="🔑 Enter Password", callback_data="extract_with_pass")
+        ],
+        [
+            InlineKeyboardButton(text="❌ Cancel & Delete", callback_data="cancel_archive")
+        ]
+    ])

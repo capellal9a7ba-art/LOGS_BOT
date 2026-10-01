@@ -13,7 +13,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
 
 from config import DOWNLOAD_DIR, SESSIONS_DIR, OUTPUT_DIR, SESSION_TTL_SECONDS, USERS_SESSIONS_DIR
-from keyboards import main_menu_keyboard, session_action_keyboard
+from keyboards import main_menu_keyboard, session_action_keyboard, password_prompt_keyboard
 from downloader import download_from_url, parse_credentials_from_text
 from cleanup import touch_session
 from extractor import (
@@ -33,6 +33,7 @@ URL_REGEX = re.compile(r"https?://\S+")
 
 class BotState(StatesGroup):
     waiting_for_keyword = State()
+    waiting_for_archive_password = State()
 
 def get_user_session_dir(user_id: int) -> Path:
     return USERS_SESSIONS_DIR / str(user_id)
@@ -103,8 +104,7 @@ async def how_to_use_callback(query: CallbackQuery):
 async def status_check_callback(query: CallbackQuery):
     await query.answer("Bot is online, workers idle, 7z engine ready!", show_alert=True)
 
-async def setup_session_archive(message: Message, archive_file: Path, password: str = None):
-    user_id = message.from_user.id
+async def execute_archive_unpack(message: Message, archive_file: Path, password: Optional[str], state: FSMContext, user_id: int):
     session_dir = get_user_session_dir(user_id)
 
     if session_dir.exists():
@@ -114,36 +114,107 @@ async def setup_session_archive(message: Message, archive_file: Path, password: 
     status_msg = await message.answer(f"⏳ <b>Unpacking archive:</b> <code>{archive_file.name}</code>...", parse_mode="HTML")
 
     loop = asyncio.get_running_loop()
-    success = await loop.run_in_executor(None, unpack_archive, archive_file, session_dir, password)
+    success, is_encrypted, err_msg = await loop.run_in_executor(None, unpack_archive, archive_file, session_dir, password)
 
-    if archive_file.exists():
+    if success:
+        # Only delete archive when extraction is verified successful!
         archive_file.unlink(missing_ok=True)
+        await state.clear()
+        stats = await loop.run_in_executor(None, scan_session_stats, session_dir)
+        await status_msg.delete()
 
-    if not success:
-        await status_msg.edit_text(
-            "❌ <b>Extraction Failed!</b>\n"
-            "Ensure the archive is not corrupted, or provide the password if encrypted (e.g. <code>pass: yourpassword</code>).",
-            parse_mode="HTML"
+        info_text = (
+            f"✅ <b>Archive Loaded Successfully!</b>\n\n"
+            f"📁 <b>Total Files:</b> <code>{stats['total_files']}</code>\n"
+            f"🔑 <b>Password Logs:</b> <code>{stats['password_files']}</code>\n"
+            f"🍪 <b>Cookie Files:</b> <code>{stats['cookie_files']}</code>\n"
+            f"💳 <b>Card Files:</b> <code>{stats['card_files']}</code>\n"
+            f"✈️ <b>TData Sessions:</b> <code>{stats['tdata_folders']}</code>\n"
+            f"🖥️ <b>RDP Profiles:</b> <code>{stats['rdp_files']}</code>\n"
+            f"📦 <b>Unpacked Size:</b> <code>{stats['size_mb']} MB</code>\n\n"
+            f"⏱️ <i>Auto-Cleanup: This session will be purged from disk in {SESSION_TTL_SECONDS // 60} minutes to keep RAM & Disk free!</i>\n\n"
+            f"🎯 <i>Select what you want to extract:</i>"
         )
-        shutil.rmtree(session_dir, ignore_errors=True)
+        await message.answer(info_text, reply_markup=session_action_keyboard(), parse_mode="HTML")
+    else:
+        # DO NOT delete archive_file if encrypted, so the user can enter/retry the password!
+        if is_encrypted:
+            await state.update_data(archive_path=str(archive_file), target_user_id=user_id)
+            await state.set_state(BotState.waiting_for_archive_password)
+            fail_text = (
+                f"🔒 <b>Archive is Encrypted with a Password!</b>\n\n"
+                f"{'❌ Password was incorrect. ' if password else ''}"
+                f"Please reply with the password to unlock this archive:"
+            )
+            await status_msg.edit_text(fail_text, parse_mode="HTML")
+        else:
+            archive_file.unlink(missing_ok=True)
+            await state.clear()
+            await status_msg.edit_text(f"❌ <b>Extraction Failed!</b> {err_msg or 'Archive corrupted.'}", parse_mode="HTML")
+
+async def prompt_archive_password_choice(message: Message, archive_file: Path, state: FSMContext, user_id: int):
+    """Asks the user first whether the archive has a password."""
+    await state.update_data(archive_path=str(archive_file), target_user_id=user_id)
+    size_mb = round(archive_file.stat().st_size / (1024 * 1024), 2)
+    prompt_text = (
+        f"📦 <b>Archive Ready:</b> <code>{archive_file.name}</code> ({size_mb} MB)\n\n"
+        f"Does this archive require a password to extract?"
+    )
+    await message.answer(prompt_text, reply_markup=password_prompt_keyboard(), parse_mode="HTML")
+
+@router.callback_query(F.data == "extract_no_pass")
+async def extract_no_pass_callback(query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    archive_path_str = data.get("archive_path")
+    if not archive_path_str or not Path(archive_path_str).exists():
+        await query.answer("⚠️ Archive file not found. Please upload again.", show_alert=True)
+        return
+    await query.message.delete()
+    await execute_archive_unpack(
+        message=query.message,
+        archive_file=Path(archive_path_str),
+        password=None,
+        state=state,
+        user_id=query.from_user.id
+    )
+    await query.answer()
+
+@router.callback_query(F.data == "extract_with_pass")
+async def extract_with_pass_callback(query: CallbackQuery, state: FSMContext):
+    await state.set_state(BotState.waiting_for_archive_password)
+    await query.message.answer("🔑 <b>Please type the archive password:</b>", parse_mode="HTML")
+    await query.answer()
+
+@router.callback_query(F.data == "cancel_archive")
+async def cancel_archive_callback(query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    archive_path_str = data.get("archive_path")
+    if archive_path_str and Path(archive_path_str).exists():
+        Path(archive_path_str).unlink(missing_ok=True)
+    await state.clear()
+    await query.message.edit_text("❌ Archive cancelled and temporary file deleted.", parse_mode="HTML")
+    await query.answer()
+
+@router.message(BotState.waiting_for_archive_password)
+async def process_archive_password_input(message: Message, state: FSMContext):
+    pass_text = message.text.strip()
+    data = await state.get_data()
+    archive_path_str = data.get("archive_path")
+    user_id = data.get("target_user_id", message.from_user.id)
+
+    if not archive_path_str or not Path(archive_path_str).exists():
+        await message.answer("⚠️ Archive file not found or expired. Please re-send the file or link.")
+        await state.clear()
         return
 
-    stats = await loop.run_in_executor(None, scan_session_stats, session_dir)
-    await status_msg.delete()
-
-    info_text = (
-        f"✅ <b>Archive Loaded Successfully!</b>\n\n"
-        f"📁 <b>Total Files:</b> <code>{stats['total_files']}</code>\n"
-        f"🔑 <b>Password Logs:</b> <code>{stats['password_files']}</code>\n"
-        f"🍪 <b>Cookie Files:</b> <code>{stats['cookie_files']}</code>\n"
-        f"💳 <b>Card Files:</b> <code>{stats['card_files']}</code>\n"
-        f"✈️ <b>TData Sessions:</b> <code>{stats['tdata_folders']}</code>\n"
-        f"🖥️ <b>RDP Profiles:</b> <code>{stats['rdp_files']}</code>\n"
-        f"📦 <b>Unpacked Size:</b> <code>{stats['size_mb']} MB</code>\n\n"
-        f"⏱️ <i>Auto-Cleanup: This session will be purged from disk in {SESSION_TTL_SECONDS // 60} minutes to keep RAM & Disk free!</i>\n\n"
-        f"🎯 <i>Select what you want to extract:</i>"
+    archive_file = Path(archive_path_str)
+    await execute_archive_unpack(
+        message=message,
+        archive_file=archive_file,
+        password=pass_text,
+        state=state,
+        user_id=user_id
     )
-    await message.answer(info_text, reply_markup=session_action_keyboard(), parse_mode="HTML")
 
 @router.message(F.document)
 async def document_upload_handler(message: Message, state: FSMContext):
@@ -183,7 +254,10 @@ async def document_upload_handler(message: Message, state: FSMContext):
         return
 
     password = parse_credentials_from_text(message.caption or "")
-    await setup_session_archive(message, file_path, password=password)
+    if password:
+        await execute_archive_unpack(message, file_path, password, state, message.from_user.id)
+    else:
+        await prompt_archive_password_choice(message, file_path, state, message.from_user.id)
 
 @router.message(F.text, StateFilter(None))
 async def text_link_handler(message: Message, state: FSMContext):
@@ -199,7 +273,10 @@ async def text_link_handler(message: Message, state: FSMContext):
     try:
         downloaded_file = await download_from_url(url)
         await status_msg.delete()
-        await setup_session_archive(message, downloaded_file, password=password)
+        if password:
+            await execute_archive_unpack(message, downloaded_file, password, state, message.from_user.id)
+        else:
+            await prompt_archive_password_choice(message, downloaded_file, state, message.from_user.id)
     except Exception as e:
         await status_msg.edit_text(f"❌ <b>Download Error:</b> <code>{str(e)}</code>", parse_mode="HTML")
 
