@@ -9,7 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://www.rarlab.com/rar/rarlinux-x64-701.tar.gz -o /tmp/rarlinux.tar.gz \
     && tar -xzf /tmp/rarlinux.tar.gz -C /tmp \
     && cp /tmp/rar/unrar /usr/local/bin/unrar \
-    && chmod 755 /usr/local/bin/unrar \
+    && cp /tmp/rar/unrar /usr/bin/unrar \
+    && chmod 755 /usr/local/bin/unrar /usr/bin/unrar \
     && rm -rf /tmp/rarlinux.tar.gz /tmp/rar \
     && rm -rf /var/lib/apt/lists/*
 

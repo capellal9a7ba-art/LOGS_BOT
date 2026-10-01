@@ -52,6 +52,32 @@ def find_system_7z() -> Optional[str]:
             return binary
     return None
 
+def is_archive_encrypted_check(archive_path: Path) -> bool:
+    """Proactively checks whether an archive requires a password."""
+    seven_z = find_system_7z()
+    if seven_z:
+        try:
+            res = subprocess.run([seven_z, "l", "-slt", "-p-", str(archive_path)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            combined = (res.stdout or "") + " " + (res.stderr or "")
+            if "Encrypted = +" in combined or any(k in combined.lower() for k in ["wrong password", "encrypted", "headers error"]):
+                return True
+        except Exception:
+            pass
+
+    unrar_bin = find_system_unrar()
+    if unrar_bin:
+        try:
+            res = subprocess.run([unrar_bin, "l", "-p-", str(archive_path)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            combined = (res.stdout or "") + " " + (res.stderr or "")
+            if res.returncode == 11 or any(k in combined.lower() for k in ["wrong password", "password required", "bad password", "corrupt header", "crc failed"]):
+                return True
+        except Exception:
+            pass
+
+    return False
+
 def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] = None) -> Tuple[bool, bool, Optional[str]]:
     """
     Unpacks ZIP, RAR, or 7Z archives completely into dest_dir.
@@ -63,11 +89,11 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
     unrar_bin = find_system_unrar()
     seven_z = find_system_7z()
     clean_pass = password.strip() if password else None
-    is_encrypted = False
+    last_error = ""
 
-    # Strategy 1: Official RARLAB unrar for RAR archives (Highest reliability for RAR5 + Encrypted)
+    # Strategy 1: Official RARLAB unrar for RAR archives
     if suffix == ".rar" and unrar_bin:
-        cmd = [unrar_bin, "x", "-y", "-idq"]
+        cmd = [unrar_bin, "x", "-y"]
         if clean_pass:
             cmd.append(f"-p{clean_pass}")
         else:
@@ -75,13 +101,19 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
         cmd.extend([str(archive_path), str(dest_dir) + os.sep])
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
-            combined_out = (res.stdout or "") + " " + (res.stderr or "")
-            if res.returncode == 11 or any(k in combined_out.lower() for k in ["wrong password", "password required", "bad password", "corrupt header"]):
-                return False, True, "Password required or wrong password"
+            combined_out = (res.stdout or "") + "\n" + (res.stderr or "")
+            last_error = combined_out.strip()
 
-            if res.returncode in (0, 1) and any(dest_dir.iterdir()):
+            if any(dest_dir.iterdir()):
                 return True, False, None
+
+            if res.returncode in (3, 11) or any(k in combined_out.lower() for k in [
+                "wrong password", "password required", "bad password", "corrupt header",
+                "crc failed", "checksum error", "data error in encrypted", "encrypted"
+            ]):
+                return False, True, "Password required or wrong password"
         except Exception as e:
+            last_error = str(e)
             print(f"[!] unrar CLI execution failed: {e}")
 
     # Strategy 2: System 7z CLI (for 7Z, ZIP, and fallback)
@@ -93,16 +125,20 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
             cmd.append("-p-")
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
-            combined_out = (res.stdout or "") + " " + (res.stderr or "")
-            if any(k in combined_out.lower() for k in ["wrong password", "data error in encrypted file", "can not open encrypted"]):
-                is_encrypted = True
+            combined_out = (res.stdout or "") + "\n" + (res.stderr or "")
+            if not last_error:
+                last_error = combined_out.strip()
 
-            if res.returncode in (0, 1) and any(dest_dir.iterdir()):
+            if any(dest_dir.iterdir()):
                 return True, False, None
-            else:
-                if is_encrypted:
-                    return False, True, "Password required or wrong password"
+
+            if any(k in combined_out.lower() for k in [
+                "wrong password", "data error in encrypted file", "can not open encrypted",
+                "encrypted", "headers error", "crc failed", "checksum error"
+            ]):
+                return False, True, "Password required or wrong password"
         except Exception as e:
+            last_error = str(e)
             print(f"[!] 7z CLI execution failed: {e}")
 
     # Strategy 3: Python Libraries Fallback
@@ -143,7 +179,12 @@ def unpack_archive(archive_path: Path, dest_dir: Path, password: Optional[str] =
         if "password" in err_str:
             return False, True, "Password required"
 
-    return False, is_encrypted, "Extraction failed"
+    # Final check: test if the archive has encryption flags
+    is_encrypted = is_archive_encrypted_check(archive_path)
+    if is_encrypted:
+        return False, True, "Password required or wrong password"
+
+    return False, False, (last_error[:120] if last_error else "Extraction failed")
 
 def is_cookie_path(root_lower: str, file_lower: str) -> bool:
     """Checks if a file is a cookie file by parent directory or filename."""
