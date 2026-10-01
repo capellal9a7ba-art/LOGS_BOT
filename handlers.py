@@ -5,6 +5,7 @@ import shutil
 import asyncio
 import zipfile
 from pathlib import Path
+from typing import Optional
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import CommandStart, Command, StateFilter
