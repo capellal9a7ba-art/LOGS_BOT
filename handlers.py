@@ -70,7 +70,7 @@ async def start_handler(message: Message, state: FSMContext):
     await state.clear()
     text = (
         "👋 <b>Welcome to Logs Extractor & Search Engine!</b>\n\n"
-        "⚡ Send me a <code>.rar</code>, <code>.zip</code>, or <code>.7z</code> log archive (up to 3GB),\n"
+        "⚡ Send me a <code>.rar</code>, <code>.zip</code>, or <code>.7z</code> log archive (up to 6GB),\n"
         "or paste a download link (GoFile, Pixeldrain, MediaFire, Direct URL).\n\n"
         "<b>Available Operations:</b>\n"
         "🔍 <b>Keyword / Domain Search:</b> Instant combo extraction (e.g. <code>epicgames.com</code>, <code>netflix</code>)\n"
@@ -91,7 +91,7 @@ async def how_to_use_callback(query: CallbackQuery):
         "<b>📖 How to Use</b>\n\n"
         "1. <b>Send a file or link:</b>\n"
         "   - Upload <code>.rar</code>, <code>.zip</code>, or <code>.7z</code> (< 20MB via Telegram).\n"
-        "   - Or paste a link from GoFile, Pixeldrain, or MediaFire (up to 3GB).\n"
+        "   - Or paste a link from GoFile, Pixeldrain, or MediaFire (up to 6GB).\n"
         "2. <b>Password:</b> If the archive has a password, include it in your text (e.g. <code>pass: 1234</code>).\n"
         "3. <b>Actions:</b> Once unpacked, tap any action button.\n"
         "4. <b>Cleanup:</b> Click <b>Delete Session</b> when finished to clear disk."
@@ -160,7 +160,7 @@ async def document_upload_handler(message: Message, state: FSMContext):
         await message.answer(
             "⚠️ <b>Telegram 20MB Direct Upload Limit:</b>\n\n"
             "Telegram prevents bots from downloading files > 20MB directly.\n"
-            "For large archives (up to 3GB), please upload to:\n"
+            "For large archives (up to 6GB), please upload to:\n"
             "• <a href='https://gofile.io'>GoFile.io</a>\n"
             "• <a href='https://pixeldrain.com'>Pixeldrain.com</a>\n"
             "• <a href='https://mediafire.com'>MediaFire</a>\n\n"
