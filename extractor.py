@@ -194,7 +194,11 @@ def is_cookie_path(root_lower: str, file_lower: str) -> bool:
 
 def is_card_path(root_lower: str, file_lower: str) -> bool:
     """Checks if a file is an autofill or card file by directory or filename."""
-    keywords = ["card", "credit", "autofill", "wallet", "payment", "web data"]
+    keywords = [
+        "card", "credit", "autofill", "auto fill", "wallet", "payment", "web data",
+        "creditcard", "cc_", "_cc", "bankcard", "debitcard", "paymentmethod",
+        "storedcard", "savedcard", "checkout", "billing"
+    ]
     if any(k in root_lower or k in file_lower for k in keywords):
         return True
     if re.search(r"\b(cc|cards|card)\b", file_lower) or file_lower in ["cc.txt", "cards.txt", "cc.log"]:
@@ -650,55 +654,60 @@ def parse_cards_from_content(content: str, cards_map: Dict[str, Tuple[str, str, 
                 _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
                 continue
 
+        found_in_line = False
         for delimiter in ["|", ";", ":", ",", "\t"]:
-            if delimiter in line_clean:
-                parts = [p.strip(' "\'{}[]') for p in line_clean.split(delimiter)]
-                for i, part in enumerate(parts):
-                    clean_digits = re.sub(r"[\s-]", "", part)
-                    if 13 <= len(clean_digits) <= 19 and clean_digits.isdigit() and clean_digits[0] != "0" and len(set(clean_digits)) > 1:
-                        c_mm, c_yy, c_cvv, c_name = "", "", "", ""
-                        
-                        if i + 1 < len(parts):
-                            next_p = parts[i + 1]
-                            m_slash = re.search(r"^(\d{1,2})[ /.-](\d{2,4})$", next_p)
-                            if m_slash:
-                                c_mm, c_yy = m_slash.group(1), m_slash.group(2)
-                                for extra in parts[i + 2:]:
-                                    if not c_cvv and (3 <= len(extra) <= 4) and extra.isdigit():
-                                        c_cvv = extra
-                                    elif not c_name:
-                                        c_name = clean_holder_name(extra)
-                            elif i + 2 < len(parts):
-                                p_m = parts[i + 1]
-                                p_y = parts[i + 2]
-                                if p_m.isdigit() and p_y.isdigit() and (len(p_m) <= 2) and (2 <= len(p_y) <= 4):
-                                    c_mm, c_yy = p_m, p_y
-                                    for extra in parts[i + 3:]:
-                                        if not c_cvv and (3 <= len(extra) <= 4) and extra.isdigit():
-                                            c_cvv = extra
-                                        elif not c_name:
-                                            c_name = clean_holder_name(extra)
-                                elif (3 <= len(p_m) <= 4) and p_m.isdigit():
-                                    m_slash2 = re.search(r"^(\d{1,2})[ /.-](\d{2,4})$", p_y)
-                                    if m_slash2:
-                                        c_cvv = p_m
-                                        c_mm, c_yy = m_slash2.group(1), m_slash2.group(2)
-                                    elif i + 3 < len(parts) and parts[i + 2].isdigit() and parts[i + 3].isdigit():
-                                        c_cvv = p_m
-                                        c_mm, c_yy = parts[i + 2], parts[i + 3]
+            if delimiter not in line_clean or found_in_line:
+                continue
+            parts = [p.strip(' "\'{}[]') for p in line_clean.split(delimiter)]
+            for i, part in enumerate(parts):
+                clean_digits = re.sub(r"[\s-]", "", part)
+                if not (13 <= len(clean_digits) <= 19 and clean_digits.isdigit() and clean_digits[0] != "0" and len(set(clean_digits)) > 1):
+                    continue
+                c_mm, c_yy, c_cvv, c_name = "", "", "", ""
 
-                        if c_mm and c_yy:
-                            if not c_name and i > 0:
-                                c_name = clean_holder_name(parts[0])
-                            c = normalize_card_entry(clean_digits, c_mm, c_yy, c_cvv, c_name)
-                            if c:
-                                _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
-                                break
-                        elif is_dedicated_card_file:
-                            c = normalize_card_entry(clean_digits, "", "", c_cvv, c_name, allow_empty_exp=True)
-                            if c:
-                                _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
-                                break
+                if i + 1 < len(parts):
+                    next_p = parts[i + 1]
+                    m_slash = re.search(r"^(\d{1,2})[ /.-](\d{2,4})$", next_p)
+                    if m_slash:
+                        c_mm, c_yy = m_slash.group(1), m_slash.group(2)
+                        for extra in parts[i + 2:]:
+                            if not c_cvv and (3 <= len(extra) <= 4) and extra.isdigit():
+                                c_cvv = extra
+                            elif not c_name:
+                                c_name = clean_holder_name(extra)
+                    elif i + 2 < len(parts):
+                        p_m = parts[i + 1]
+                        p_y = parts[i + 2]
+                        if p_m.isdigit() and p_y.isdigit() and (len(p_m) <= 2) and (2 <= len(p_y) <= 4):
+                            c_mm, c_yy = p_m, p_y
+                            for extra in parts[i + 3:]:
+                                if not c_cvv and (3 <= len(extra) <= 4) and extra.isdigit():
+                                    c_cvv = extra
+                                elif not c_name:
+                                    c_name = clean_holder_name(extra)
+                        elif (3 <= len(p_m) <= 4) and p_m.isdigit():
+                            m_slash2 = re.search(r"^(\d{1,2})[ /.-](\d{2,4})$", p_y)
+                            if m_slash2:
+                                c_cvv = p_m
+                                c_mm, c_yy = m_slash2.group(1), m_slash2.group(2)
+                            elif i + 3 < len(parts) and parts[i + 2].isdigit() and parts[i + 3].isdigit():
+                                c_cvv = p_m
+                                c_mm, c_yy = parts[i + 2], parts[i + 3]
+
+                if c_mm and c_yy:
+                    if not c_name and i > 0:
+                        c_name = clean_holder_name(parts[0])
+                    c = normalize_card_entry(clean_digits, c_mm, c_yy, c_cvv, c_name)
+                    if c:
+                        _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+                        found_in_line = True
+                        break
+                elif is_dedicated_card_file:
+                    c = normalize_card_entry(clean_digits, "", "", c_cvv, c_name, allow_empty_exp=True)
+                    if c:
+                        _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+                        found_in_line = True
+                        break
 
     # 2. Key-Value, Stealer blocks, and JSON parser
     for idx, line in enumerate(lines):
@@ -773,30 +782,30 @@ def parse_cards_from_content(content: str, cards_map: Dict[str, Tuple[str, str, 
             if c:
                 _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
 
-    # 3. Standalone card search across dedicated card files ONLY
-    if is_dedicated_card_file:
-        re_card_digits = re.compile(
-            r"\b([3-6]\d{3}[ -]?\d{4}[ -]?\d{4}[ -]?\d{1,4}|2[2-7]\d{2}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}|4\d{12,18}|5[1-5]\d{14}|3[47]\d{13})\b"
-        )
-        for idx, line in enumerate(lines):
-            for cm in re_card_digits.finditer(line):
-                candidate = cm.group(1)
-                clean_digits = re.sub(r"\D", "", candidate)
-                if clean_digits in cards_map:
-                    continue
-                if 13 <= len(clean_digits) <= 19 and luhn_checksum(clean_digits):
-                    window_lines = lines[max(0, idx - 4) : min(len(lines), idx + 5)]
-                    context = " ".join(window_lines)
-                    m_exp = re.search(r"\b(0?[1-9]|1[0-2])[ /.-](\d{2,4})\b", context)
-                    m_cvv = re.search(r"(?:cvv|cvc|cvn|code)[:= ]+(\d{3,4})\b", context, re.IGNORECASE)
-                    cvv_v = m_cvv.group(1) if m_cvv else ""
-                    
-                    if m_exp:
-                        c = normalize_card_entry(clean_digits, m_exp.group(1), m_exp.group(2), cvv_v, "", allow_empty_exp=True)
-                    else:
-                        c = normalize_card_entry(clean_digits, "", "", cvv_v, "", allow_empty_exp=True)
-                    if c:
-                        _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+    # 3. Standalone card search — runs on ALL files (not limited to dedicated)
+    re_card_digits = re.compile(
+        r"\b([3-6]\d{3}[ -]?\d{4}[ -]?\d{4}[ -]?\d{1,4}|2[2-7]\d{2}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}|4\d{12,18}|5[1-5]\d{14}|3[47]\d{13})\b"
+    )
+    for idx, line in enumerate(lines):
+        for cm in re_card_digits.finditer(line):
+            candidate = cm.group(1)
+            clean_digits = re.sub(r"\D", "", candidate)
+            if clean_digits in cards_map:
+                continue
+            if 13 <= len(clean_digits) <= 19 and luhn_checksum(clean_digits):
+                window_lines = lines[max(0, idx - 4) : min(len(lines), idx + 5)]
+                context = " ".join(window_lines)
+                m_exp = re.search(r"\b(0?[1-9]|1[0-2])[ /.-](\d{2,4})\b", context)
+                m_cvv = re.search(r"(?:cvv|cvc|cvn|csc|code)[:= ]+(\d{3,4})\b", context, re.IGNORECASE)
+                cvv_v = m_cvv.group(1) if m_cvv else ""
+
+                if m_exp:
+                    c = normalize_card_entry(clean_digits, m_exp.group(1), m_exp.group(2), cvv_v, "", allow_empty_exp=True)
+                else:
+                    # No exp found — only save if dedicated file or CVV present
+                    c = normalize_card_entry(clean_digits, "", "", cvv_v, "", allow_empty_exp=is_dedicated_card_file or bool(cvv_v))
+                if c:
+                    _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
 
 def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
     """
