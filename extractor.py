@@ -194,8 +194,12 @@ def is_cookie_path(root_lower: str, file_lower: str) -> bool:
 
 def is_card_path(root_lower: str, file_lower: str) -> bool:
     """Checks if a file is an autofill or card file by directory or filename."""
-    keywords = ["card", "credit", "autofill", "cc", "wallet", "payment", "web data", "important", "info"]
-    return any(k in root_lower or k in file_lower for k in keywords)
+    keywords = ["card", "credit", "autofill", "wallet", "payment", "web data"]
+    if any(k in root_lower or k in file_lower for k in keywords):
+        return True
+    if re.search(r"\b(cc|cards|card)\b", file_lower) or file_lower in ["cc.txt", "cards.txt", "cc.log"]:
+        return True
+    return False
 
 def scan_session_stats(session_path: Path) -> dict:
     """Analyzes unpacked logs to count total files, logs, cookies, passwords, and sessions."""
@@ -392,24 +396,32 @@ def luhn_checksum(num_str: str) -> bool:
         return False
 
 def clean_holder_name(raw_name: str) -> str:
-    """Filters out binary hex strings, numbers, and non-name junk."""
+    """Filters out binary hex strings, numbers, emails, URLs, and non-name junk."""
     if not raw_name:
         return ""
-    s = raw_name.strip()
-    # Reject strings containing digits (names do not contain numbers)
-    if re.search(r"\d", s):
+    s = raw_name.strip(' "\'{}[]:,;')
+    # Reject strings containing digits, emails, URLs, or path separators
+    if re.search(r"[\d@/\\]", s):
         return ""
     # Reject strings with memory/hex dump patterns like "00 00 00", "AE A2 C0", "F7 7F"
     if re.search(r"\b[0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2}\b", s):
         return ""
-    if any(k in s.lower() for k in ["card", "credit", "expire", "cvv", "master", "visa", "http", "null", "none", "true", "false", "value:"]):
+    if any(k in s.lower() for k in ["card", "credit", "exp", "cvv", "cvc", "master", "visa", "http", "null", "none", "true", "false", "value", "name"]):
         return ""
     return s[:40].strip()
 
-def normalize_card_entry(raw_num: str, mm: str = "01", yy: str = "30", cvv: str = "", name: str = "") -> Optional[Tuple[str, str, str, str, str]]:
+def normalize_card_entry(
+    raw_num: str,
+    mm: str = "",
+    yy: str = "",
+    cvv: str = "",
+    name: str = "",
+    allow_empty_exp: bool = False
+) -> Optional[Tuple[str, str, str, str, str]]:
     """
     Maximal card parser: extracts cards from anywhere in logs regardless of expired month/year.
-    Only filters out dummy zero-fill memory noise (00000000000000) or non-digit strings.
+    Preserves real expiration dates (even if expired years like 18, 19, 20, 21, 22, 23, 24).
+    Never fabricates fake defaults (01/30).
     """
     clean_num = re.sub(r"[\s-]", "", raw_num)
     if not (13 <= len(clean_num) <= 19) or not clean_num.isdigit():
@@ -417,20 +429,39 @@ def normalize_card_entry(raw_num: str, mm: str = "01", yy: str = "30", cvv: str 
     # Reject numbers starting with 0 or with all identical digits
     if clean_num[0] == "0" or len(set(clean_num)) <= 1:
         return None
+    if not luhn_checksum(clean_num):
+        return None
 
-    # Clean month and year
+    month_str = ""
+    year_str = ""
+
     clean_mm = re.sub(r"\D", "", mm.strip()) if mm else ""
     clean_yy = re.sub(r"\D", "", yy.strip()) if yy else ""
 
-    # Detect if YY and MM are swapped (e.g. 2026/05 or 26/05)
     if clean_mm and clean_yy:
         val_m = int(clean_mm) if clean_mm.isdigit() else 0
         val_y = int(clean_yy) if clean_yy.isdigit() else 0
+
+        # Detect if YY and MM are swapped (e.g. 2026/05 or 26/05)
         if val_m > 12 and 1 <= val_y <= 12:
             clean_mm, clean_yy = clean_yy, clean_mm
+            val_m, val_y = val_y, val_m
 
-    month_str = clean_mm.zfill(2)[-2:] if clean_mm else "01"
-    year_str = clean_yy[-2:] if clean_yy else "30"
+        if 1 <= val_m <= 12:
+            month_str = str(val_m).zfill(2)
+            year_str = clean_yy[-2:]
+    elif clean_mm and not clean_yy:
+        m_comb = re.match(r"^(\d{1,2})[ /.-]?(\d{2,4})$", mm.strip())
+        if m_comb:
+            val_m = int(m_comb.group(1))
+            clean_y = m_comb.group(2)
+            if 1 <= val_m <= 12:
+                month_str = str(val_m).zfill(2)
+                year_str = clean_y[-2:]
+
+    # If expiration date is missing but empty expiration is allowed
+    if not (month_str and year_str) and not allow_empty_exp:
+        return None
 
     clean_cvv = re.sub(r"\D", "", cvv.strip()) if cvv else ""
     if not (3 <= len(clean_cvv) <= 4):
@@ -445,46 +476,44 @@ def _save_card_record(cards_map: Dict[str, Tuple[str, str, str, str]], num: str,
         cards_map[num] = (mm, yy, cvv, name)
     else:
         old_mm, old_yy, old_cvv, old_name = cards_map[num]
-        new_mm = mm if (mm != "01" or old_mm == "01") else old_mm
-        new_yy = yy if (yy != "30" or old_yy == "30") else old_yy
+        new_mm = old_mm if old_mm else mm
+        new_yy = old_yy if old_yy else yy
         new_cvv = cvv if cvv else old_cvv
         new_name = name if name else old_name
         cards_map[num] = (new_mm, new_yy, new_cvv, new_name)
 
 def extract_cards_from_sqlite_db(db_path: Path, cards_map: Dict[str, Tuple[str, str, str, str]]):
-    """Queries Chromium Web Data SQLite databases directly for credit cards and autofill."""
+    """Queries Chromium Web Data SQLite databases directly for credit cards and autofill payment data."""
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
         cursor = conn.cursor()
         
-        # 1. credit_cards table
+        # credit_cards table
         try:
             cursor.execute("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards")
             for row in cursor.fetchall():
                 holder = str(row[0] or "").strip()
-                mm = str(row[1] or "01")
-                yy = str(row[2] or "30")
+                mm = str(row[1] or "")
+                yy = str(row[2] or "")
                 card_data = str(row[3] or "")
                 num_m = re.search(r"\b(\d{13,19})\b", card_data)
                 if num_m:
-                    c = normalize_card_entry(num_m.group(1), mm, yy, "", holder)
+                    c = normalize_card_entry(num_m.group(1), mm, yy, "", holder, allow_empty_exp=True)
                     if c:
                         _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
         except Exception:
             pass
 
-        # 2. autofill table
+        # autofill table
         try:
-            cursor.execute("SELECT name, value FROM autofill")
-            for row in cursor.fetchall():
-                name_col = str(row[0] or "").lower()
-                val_col = str(row[1] or "").strip()
-                if any(k in name_col for k in ["card", "cc", "number", "ccn"]) or (13 <= len(re.sub(r'\D', '', val_col)) <= 19):
-                    num_m = re.search(r"\b([3-6]\d{12,18}|2[2-7]\d{14})\b", re.sub(r'[\s-]', '', val_col))
-                    if num_m:
-                        c = normalize_card_entry(num_m.group(1), "01", "30", "", "")
-                        if c:
-                            _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+            cursor.execute("SELECT name, value FROM autofill WHERE name LIKE '%card%' OR name LIKE '%cc%' OR name LIKE '%number%' OR name LIKE '%exp%' OR name LIKE '%cvv%'")
+            for r_name, r_val in cursor.fetchall():
+                val_clean = str(r_val or "").strip()
+                digits = re.sub(r"\D", "", val_clean)
+                if 13 <= len(digits) <= 19 and luhn_checksum(digits):
+                    c = normalize_card_entry(digits, "", "", "", "", allow_empty_exp=True)
+                    if c:
+                        _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
         except Exception:
             pass
 
@@ -492,49 +521,91 @@ def extract_cards_from_sqlite_db(db_path: Path, cards_map: Dict[str, Tuple[str, 
     except Exception:
         pass
 
-def parse_cards_from_content(content: str, cards_map: Dict[str, Tuple[str, str, str, str]]):
+def parse_cards_from_content(content: str, cards_map: Dict[str, Tuple[str, str, str, str]], is_dedicated_card_file: bool = False):
     """Parses credit cards from text content across all known stealer and dump formats."""
     lines = content.splitlines()
 
-    # Pattern 1: Pure pipe format (NUMBER|MM|YY... or NUMBER|MM|YYYY|CVV|NAME)
-    re_pipe = re.compile(
-        r"(?:^|[^\d])([0-9]{13,19})\s*\|\s*(\d{1,2})\s*\|\s*(\d{2,4})(?:\s*\|\s*(\d{3,4}))?(?:\s*\|\s*([^|\r\n]*))?",
-        re.MULTILINE
+    re_card_header = re.compile(
+        r"""["']?(?:card[\w ]*number|cc[\w ]*number|ccn|pan|credit[\w ]*card|card|cc|cardnumber)["']?\s*[:=]\s*["']?([0-9 -]{13,22})["']?""",
+        re.IGNORECASE
     )
-    for m in re_pipe.finditer(content):
-        c = normalize_card_entry(m.group(1), m.group(2), m.group(3), m.group(4) or "", m.group(5) or "")
-        if c:
-            _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
-
-    # Pattern 1b: Date with slash/hyphen (NUMBER|MM/YY|CVV or NUMBER:MM/YY:CVV or NUMBER MM/YY CVV)
-    re_slash_date = re.compile(
-        r"(?:^|[^\d])([0-9]{13,19})\s*[|:;, ]\s*(\d{1,2})[ /.-](\d{2,4})(?:\s*[|:;, ]\s*(\d{3,4}))?(?:\s*[|:;, ]\s*([^|\r\n]*))?",
-        re.MULTILINE
+    re_exp_full = re.compile(
+        r"""["']?(?:exp[\w ]*|valid[\w ]*|expiry|expiration|expires|date)["']?\s*[:=]\s*["']?(\d{1,2})[ /.-](\d{2,4})["']?""",
+        re.IGNORECASE
     )
-    for m in re_slash_date.finditer(content):
-        c = normalize_card_entry(m.group(1), m.group(2), m.group(3), m.group(4) or "", m.group(5) or "")
-        if c:
-            _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
-
-    # Pattern 1c: Colon format (NUMBER:MM:YY:CVV or NUMBER:MM:YYYY:CVV)
-    re_colon = re.compile(
-        r"(?:^|[^\d])([0-9]{13,19})\s*:\s*(\d{1,2})\s*:\s*(\d{2,4})(?:\s*:\s*(\d{3,4}))?(?:\s*:\s*([^:\r\n]*))?",
-        re.MULTILINE
+    re_exp_m = re.compile(r"""["']?(?:exp[\w ]*month|month|exp_m)["']?\s*[:=]\s*["']?(\d{1,2})["']?""", re.IGNORECASE)
+    re_exp_y = re.compile(r"""["']?(?:exp[\w ]*year|year|exp_y)["']?\s*[:=]\s*["']?(\d{2,4})["']?""", re.IGNORECASE)
+    re_cvv = re.compile(r"""["']?(?:cvv\w*|cvc\w*|security[\w ]*code|code|cvn)["']?\s*[:=]\s*["']?(\d{3,4})["']?""", re.IGNORECASE)
+    re_holder = re.compile(r"""["']?(?:card[\w ]*holder|holder|name[\w ]*card|card[\w ]*name|name_on_card|full_name)["']?\s*[:=]\s*["']?([^"\r\n]+)["']?""", re.IGNORECASE)
+    re_space_pattern = re.compile(
+        r"\b([3-6]\d{3}[ -]?\d{4}[ -]?\d{4}[ -]?\d{1,4}|2[2-7]\d{2}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}|4\d{12,18}|5[1-5]\d{14}|3[47]\d{13})\s+(0?[1-9]|1[0-2])[/-](\d{2,4})(?:\s+(\d{3,4}))?\b"
     )
-    for m in re_colon.finditer(content):
-        c = normalize_card_entry(m.group(1), m.group(2), m.group(3), m.group(4) or "", m.group(5) or "")
-        if c:
-            _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
 
-    # Pattern 2: Stealer key-value blocks (Redline, Vidar, Lumma, Stealc, Meta, etc.)
-    re_card_header = re.compile(r"(?:card(?:[ _]?number)?|cc(?:[ _]?number)?|ccn|number|pan)\s*[:=]\s*([0-9 -]{13,22})", re.IGNORECASE)
-    re_exp_full = re.compile(r"(?:exp(?:ir(?:y|ation))?[ _]?(?:date)?|expires|valid(?:ity)?)\s*[:=]\s*(\d{1,2})[ /.-](\d{2,4})", re.IGNORECASE)
-    re_exp_m = re.compile(r"(?:exp(?:ir(?:y|ation))?[ _]?month|month)\s*[:=]\s*(\d{1,2})", re.IGNORECASE)
-    re_exp_y = re.compile(r"(?:exp(?:ir(?:y|ation))?[ _]?year|year)\s*[:=]\s*(\d{2,4})", re.IGNORECASE)
-    re_cvv = re.compile(r"(?:cvv2?|cvc2?|security[ _]?code|code|cvn)\s*[:=]\s*(\d{3,4})", re.IGNORECASE)
-    re_holder = re.compile(r"(?:card[ _]?holder|holder|name[ _]?on[ _]?card|card[ _]?name|holder[ _]?name)\s*[:=]\s*([^\r\n]+)", re.IGNORECASE)
+    # 1. Delimited line parser (|, ;, :, ,, \t) and inline space patterns
+    for line in lines:
+        line_clean = line.strip()
+        if not line_clean or not any(c.isdigit() for c in line_clean):
+            continue
 
-    # Pattern 3: Autofill block parsing & multi-line block detection
+        sp_m = re_space_pattern.search(line_clean)
+        if sp_m:
+            cand = sp_m.group(1)
+            c = normalize_card_entry(cand, sp_m.group(2), sp_m.group(3), sp_m.group(4) or "", "")
+            if c:
+                _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+                continue
+
+        for delimiter in ["|", ";", ":", ",", "\t"]:
+            if delimiter in line_clean:
+                parts = [p.strip(' "\'{}[]') for p in line_clean.split(delimiter)]
+                for i, part in enumerate(parts):
+                    clean_digits = re.sub(r"[\s-]", "", part)
+                    if 13 <= len(clean_digits) <= 19 and clean_digits.isdigit() and clean_digits[0] != "0" and len(set(clean_digits)) > 1:
+                        c_mm, c_yy, c_cvv, c_name = "", "", "", ""
+                        
+                        if i + 1 < len(parts):
+                            next_p = parts[i + 1]
+                            m_slash = re.search(r"^(\d{1,2})[ /.-](\d{2,4})$", next_p)
+                            if m_slash:
+                                c_mm, c_yy = m_slash.group(1), m_slash.group(2)
+                                for extra in parts[i + 2:]:
+                                    if not c_cvv and (3 <= len(extra) <= 4) and extra.isdigit():
+                                        c_cvv = extra
+                                    elif not c_name:
+                                        c_name = clean_holder_name(extra)
+                            elif i + 2 < len(parts):
+                                p_m = parts[i + 1]
+                                p_y = parts[i + 2]
+                                if p_m.isdigit() and p_y.isdigit() and (len(p_m) <= 2) and (2 <= len(p_y) <= 4):
+                                    c_mm, c_yy = p_m, p_y
+                                    for extra in parts[i + 3:]:
+                                        if not c_cvv and (3 <= len(extra) <= 4) and extra.isdigit():
+                                            c_cvv = extra
+                                        elif not c_name:
+                                            c_name = clean_holder_name(extra)
+                                elif (3 <= len(p_m) <= 4) and p_m.isdigit():
+                                    m_slash2 = re.search(r"^(\d{1,2})[ /.-](\d{2,4})$", p_y)
+                                    if m_slash2:
+                                        c_cvv = p_m
+                                        c_mm, c_yy = m_slash2.group(1), m_slash2.group(2)
+                                    elif i + 3 < len(parts) and parts[i + 2].isdigit() and parts[i + 3].isdigit():
+                                        c_cvv = p_m
+                                        c_mm, c_yy = parts[i + 2], parts[i + 3]
+
+                        if c_mm and c_yy:
+                            if not c_name and i > 0:
+                                c_name = clean_holder_name(parts[0])
+                            c = normalize_card_entry(clean_digits, c_mm, c_yy, c_cvv, c_name)
+                            if c:
+                                _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+                                break
+                        elif is_dedicated_card_file:
+                            c = normalize_card_entry(clean_digits, "", "", c_cvv, c_name, allow_empty_exp=True)
+                            if c:
+                                _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+                                break
+
+    # 2. Key-Value, Stealer blocks, and JSON parser
     for idx, line in enumerate(lines):
         line_clean = line.strip()
         raw_num = None
@@ -542,72 +613,111 @@ def parse_cards_from_content(content: str, cards_map: Dict[str, Tuple[str, str, 
         num_m = re_card_header.search(line_clean)
         if num_m:
             raw_num = num_m.group(1)
-        elif line_clean.lower().startswith("value:"):
+        elif line_clean.lower().startswith("value:") or '"value"' in line_clean.lower():
             prev_line = lines[idx - 1].strip().lower() if idx > 0 else ""
-            if any(k in prev_line for k in ["card", "cc", "number", "ccn"]):
-                val_m = re.search(r"value\s*[:=]\s*([0-9 -]{13,22})", line_clean, re.IGNORECASE)
+            if any(k in prev_line for k in ["card", "cc", "number", "ccn", "pan"]):
+                val_m = re.search(r"""value["']?\s*[:=]\s*["']?([0-9 -]{13,22})["']?""", line_clean, re.IGNORECASE)
                 if val_m:
                     raw_num = val_m.group(1)
 
         if raw_num:
-            c_mm, c_yy, c_cvv, c_name = "01", "30", "", ""
-            window = lines[max(0, idx - 6): min(len(lines), idx + 10)]
+            c_mm, c_yy, c_cvv, c_name = "", "", "", ""
             
-            for w_idx, w in enumerate(window):
-                w_str = w.strip()
-                ef = re_exp_full.search(w_str)
-                if ef:
-                    c_mm, c_yy = ef.group(1), ef.group(2)
-                else:
-                    em = re_exp_m.search(w_str)
-                    if em:
-                        c_mm = em.group(1)
-                    ey = re_exp_y.search(w_str)
-                    if ey:
-                        c_yy = ey.group(1)
-                
-                cv = re_cvv.search(w_str)
-                if cv:
-                    c_cvv = cv.group(1)
+            ef = re_exp_full.search(line_clean)
+            if ef:
+                c_mm, c_yy = ef.group(1), ef.group(2)
+            else:
+                em = re_exp_m.search(line_clean)
+                if em:
+                    c_mm = em.group(1)
+                ey = re_exp_y.search(line_clean)
+                if ey:
+                    c_yy = ey.group(1)
+            cv = re_cvv.search(line_clean)
+            if cv:
+                c_cvv = cv.group(1)
+            ho = re_holder.search(line_clean)
+            if ho:
+                c_name = ho.group(1)
 
-                ho = re_holder.search(w_str)
-                if ho:
-                    c_name = ho.group(1)
+            if not (c_mm and c_yy):
+                for j in range(idx + 1, min(len(lines), idx + 10)):
+                    w_str = lines[j].strip()
+                    if not w_str or w_str.startswith("=") or (re_card_header.search(w_str) and not w_str.lower().startswith("value:")):
+                        break
+                    ef = re_exp_full.search(w_str)
+                    if ef and not c_mm:
+                        c_mm, c_yy = ef.group(1), ef.group(2)
+                    else:
+                        em = re_exp_m.search(w_str)
+                        if em and not c_mm:
+                            c_mm = em.group(1)
+                        ey = re_exp_y.search(w_str)
+                        if ey and not c_yy:
+                            c_yy = ey.group(1)
+                    
+                    cv = re_cvv.search(w_str)
+                    if cv and not c_cvv:
+                        c_cvv = cv.group(1)
 
-                if "name:" in w_str.lower() and w_idx + 1 < len(window):
-                    next_w = window[w_idx + 1].strip()
-                    if next_w.lower().startswith("value:"):
-                        val_content = next_w.split(":", 1)[1].strip()
-                        if any(k in w_str.lower() for k in ["month", "exp_m"]):
-                            c_mm = val_content
-                        elif any(k in w_str.lower() for k in ["year", "exp_y"]):
-                            c_yy = val_content
-                        elif any(k in w_str.lower() for k in ["cvv", "cvc", "code"]):
-                            c_cvv = val_content
-                        elif any(k in w_str.lower() for k in ["holder", "cardholder", "name_on_card", "full_name"]) or (w_str.lower().startswith("name:") and "cc" not in w_str.lower() and "card" not in w_str.lower() and "number" not in w_str.lower()):
-                            c_name = val_content
+                    ho = re_holder.search(w_str)
+                    if ho and not c_name:
+                        c_name = ho.group(1)
 
-            c = normalize_card_entry(raw_num, c_mm, c_yy, c_cvv, c_name)
+                    if "name" in w_str.lower() and j + 1 < len(lines):
+                        next_w = lines[j + 1].strip()
+                        if next_w.lower().startswith("value:") or '"value"' in next_w.lower():
+                            val_content = next_w.split(":", 1)[1].strip(' "\',')
+                            if any(k in w_str.lower() for k in ["month", "exp_m"]):
+                                c_mm = val_content
+                            elif any(k in w_str.lower() for k in ["year", "exp_y"]):
+                                c_yy = val_content
+                            elif any(k in w_str.lower() for k in ["exp", "valid", "date"]):
+                                m_val = re.search(r"(\d{1,2})[ /.-](\d{2,4})", val_content)
+                                if m_val:
+                                    c_mm, c_yy = m_val.group(1), m_val.group(2)
+                            elif any(k in w_str.lower() for k in ["cvv", "cvc", "code"]):
+                                c_cvv = val_content
+                            elif any(k in w_str.lower() for k in ["holder", "cardholder", "name_on_card", "full_name"]) or (w_str.lower().startswith("name:") and "cc" not in w_str.lower() and "card" not in w_str.lower() and "number" not in w_str.lower()):
+                                c_name = val_content
+
+            if not c_name:
+                for j in range(max(0, idx - 3), idx):
+                    w_str = lines[j].strip()
+                    if w_str.startswith("=") or w_str.startswith("-"):
+                        continue
+                    ho = re_holder.search(w_str)
+                    if ho:
+                        c_name = ho.group(1)
+                        break
+
+            c = normalize_card_entry(raw_num, c_mm, c_yy, c_cvv, c_name, allow_empty_exp=True)
             if c:
                 _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
 
-    # Pattern 4: Standalone card search across any log line (valid Luhn cards)
-    re_card_digits = re.compile(r"\b([3-6]\d{3}[ -]?\d{4}[ -]?\d{4}[ -]?\d{1,4}|2[2-7]\d{2}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}|4\d{12,18}|5[1-5]\d{14}|3[47]\d{13})\b")
+    # 3. Standalone card search across any log line
+    re_card_digits = re.compile(
+        r"\b([3-6]\d{3}[ -]?\d{4}[ -]?\d{4}[ -]?\d{1,4}|2[2-7]\d{2}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}|4\d{12,18}|5[1-5]\d{14}|3[47]\d{13})\b"
+    )
     for idx, line in enumerate(lines):
         for cm in re_card_digits.finditer(line):
             candidate = cm.group(1)
             clean_digits = re.sub(r"\D", "", candidate)
             if 13 <= len(clean_digits) <= 19 and luhn_checksum(clean_digits):
-                context = line + " " + (lines[idx + 1] if idx + 1 < len(lines) else "")
+                window_lines = lines[max(0, idx - 4) : min(len(lines), idx + 5)]
+                context = " ".join(window_lines)
                 m_exp = re.search(r"\b(0?[1-9]|1[0-2])[ /.-](\d{2,4})\b", context)
-                m_cvv = re.search(r"\b(\d{3,4})\b", context.replace(candidate, ""))
-                
-                exp_m = m_exp.group(1) if m_exp else "01"
-                exp_y = m_exp.group(2) if m_exp else "30"
+                m_cvv = re.search(r"(?:cvv|cvc|cvn|code)[:= ]+(\d{3,4})\b", context, re.IGNORECASE)
                 cvv_v = m_cvv.group(1) if m_cvv else ""
-                c = normalize_card_entry(clean_digits, exp_m, exp_y, cvv_v, "")
-                if c:
-                    _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+                
+                if m_exp:
+                    c = normalize_card_entry(clean_digits, m_exp.group(1), m_exp.group(2), cvv_v, "")
+                    if c:
+                        _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
+                elif is_dedicated_card_file:
+                    c = normalize_card_entry(clean_digits, "", "", cvv_v, "", allow_empty_exp=True)
+                    if c:
+                        _save_card_record(cards_map, c[0], c[1], c[2], c[3], c[4])
 
 def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
     """
@@ -630,6 +740,7 @@ def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
 
             file_path = Path(root) / file
             initial_count = len(cards_map)
+            is_dedicated = is_card_path(root_l, fl)
 
             # SQLite check
             if fl == "web data" or ext in [".sqlite", ".db"]:
@@ -637,7 +748,7 @@ def collect_cards(session_path: Path, output_file: Path) -> Tuple[int, int]:
 
             content = read_file_safe(file_path)
             if content:
-                parse_cards_from_content(content, cards_map)
+                parse_cards_from_content(content, cards_map, is_dedicated_card_file=is_dedicated)
 
             if len(cards_map) > initial_count:
                 files_with_cards += 1
